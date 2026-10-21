@@ -1,0 +1,19 @@
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile every script
+        run: python -m py_compile vr-log-inspector/*.py vr-session-recorder/*.py tools/*.py
+      - name: Theme contrast (VR Log Inspector)
+        run: python tools/check_contrast.py vr-log-inspector/vr_log_inspector.py

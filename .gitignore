@@ -1,0 +1,15 @@
+# build output
+dist/
+*.zip
+# downloaded at runtime by the tools
+platform-tools/
+python/
+vr_sessions/
+# Python
+__pycache__/
+*.pyc
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
