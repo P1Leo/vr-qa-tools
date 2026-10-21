@@ -33,7 +33,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-TOOL_VERSION = "1.5"
+TOOL_VERSION = "1.6"
 ADB = None
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # hide console windows on Windows
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -584,6 +584,35 @@ details input{width:100%;font-family:var(--mono);font-size:calc(12px * var(--fs)
 /* log pane */
 section.logs{display:grid;grid-template-rows:auto auto 1fr auto;grid-template-columns:minmax(0,1fr);min-width:0;min-height:0}
 main.noside{grid-template-columns:minmax(0,1fr)}
+section.logs > .toolbar{grid-row:1;grid-column:1}
+section.logs > .cols{grid-row:2;grid-column:1}
+section.logs > .viewport{grid-row:3;grid-column:1}
+section.logs > .detail{grid-row:4;grid-column:1}
+/* issues + bookmarks drawer: shares rows 2-3 of the log pane, on the right */
+.drawer{grid-row:2 / 4;grid-column:1;justify-self:end;align-self:stretch;width:min(calc(400px * var(--fs)), 65%);z-index:4;
+  background:var(--panel);border-left:1px solid var(--line);box-shadow:-10px 0 24px rgba(0,0,0,.25);display:flex;flex-direction:column;min-height:0}
+.drawer[hidden]{display:none}
+.drawer .dh{display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid var(--line)}
+.drawer .tabs{display:flex;gap:4px;margin-right:auto}
+.drawer .tabs button[aria-selected="true"]{border-color:var(--accent);color:var(--accent)}
+.drawer .dn{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--line);color:var(--muted)}
+.drawer .list{overflow:auto;flex:1;min-height:0;padding:6px}
+.drawer .empty2{color:var(--muted);padding:14px 8px}
+.it{border:1px solid var(--line);border-radius:8px;padding:7px 9px;margin-bottom:6px;background:var(--panel-2);cursor:pointer}
+.it:hover,.it:focus-visible{border-color:var(--accent)}
+.it.cur{border-color:var(--accent);box-shadow:inset 3px 0 0 var(--accent)}
+.it .top{display:flex;align-items:center;gap:7px;font-size:calc(12px * var(--fs))}
+.it .when{font-family:var(--mono);color:var(--muted)}
+.it .cnt{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums}
+.it .ttl{margin-top:4px;font-family:var(--mono);font-size:calc(12px * var(--fs));word-break:break-word}
+.it .sub{margin-top:2px;color:var(--muted);font-size:calc(11.5px * var(--fs));word-break:break-word}
+.it input{width:100%;margin-top:6px;font-size:calc(12px * var(--fs))}
+.it .x{border:0;background:none;padding:0 4px;color:var(--muted);margin-left:auto}
+.kb{display:inline-block;font-size:calc(11px * var(--fs));font-weight:600;padding:0 6px;border-radius:5px;border:1px solid currentColor;white-space:nowrap}
+.k-crash,.k-native{color:var(--l-f)} .k-anr,.k-exception,.k-oom{color:var(--l-e)} .k-died,.k-lmk,.k-perf{color:var(--l-w)}
+.badge{display:inline-block;min-width:1.6em;padding:0 5px;border-radius:99px;background:var(--panel-2);color:var(--muted);font-size:calc(11px * var(--fs));text-align:center;font-variant-numeric:tabular-nums;margin-left:4px}
+.badge.hot{background:var(--l-e);color:var(--bg);font-weight:700}
+.viewport .row.bm .tg2::before{content:"⚑ ";color:var(--accent)}
 main.noside aside{display:none}
 /* when large text leaves little room, drop PID first, then time; the detail panel always shows both */
 .nopid .cols,.nopid .row{grid-template-columns:4px calc(26px * var(--fs)) calc(108px * var(--fs)) 0 calc(22px * var(--fs)) minmax(calc(80px * var(--fs)),calc(150px * var(--fs))) 1fr}
@@ -805,6 +834,7 @@ mark{background:color-mix(in srgb, var(--accent) 35%, transparent);color:inherit
     <select id="expScope" title="What to export">
       <option value="selected">Selected lines</option>
       <option value="filtered">All shown lines</option>
+      <option value="bookmarked">Bookmarked lines</option>
       <option value="all">Everything captured</option>
     </select>
     <select id="expFmt" title="File format">
@@ -816,10 +846,25 @@ mark{background:color-mix(in srgb, var(--accent) 35%, transparent);color:inherit
     <label class="chk" title="Keep the newest line in view"><input type="checkbox" id="follow" checked> Follow</label>
     <button id="clearLogs" class="danger" title="Clear the lines in this viewer">Clear</button>
     <button id="sideBtn" aria-controls="side" aria-expanded="true" title="Show or hide the filter panel">Hide filters</button>
+    <button id="issuesBtn" aria-controls="drawer" title="Crashes, ANRs, exceptions and other problems found in the log (F8 next, Shift+F8 previous)">Issues<span class="badge" id="issuesCnt">0</span></button>
+    <button id="bmBtn" aria-controls="drawer" title="Lines you bookmarked (B to bookmark, F2 next, Shift+F2 previous)">Bookmarks<span class="badge" id="bmCnt">0</span></button>
   </div>
   <div class="cols" aria-hidden="true">
     <div></div><div></div><div class="t">Time</div><div class="p">PID / TID</div><div>L</div><div>Tag</div><div>Message</div>
   </div>
+  <aside class="drawer" id="drawer" hidden aria-label="Issues and bookmarks">
+    <div class="dh">
+      <div class="tabs" role="tablist">
+        <button role="tab" id="tabIssues" aria-selected="true">Issues</button>
+        <button role="tab" id="tabBm" aria-selected="false">Bookmarks</button>
+      </div>
+      <button id="dwPrev" title="Previous (Shift+F8 / Shift+F2)">↑</button>
+      <button id="dwNext" title="Next (F8 / F2)">↓</button>
+      <button id="dwClose" title="Close">✕</button>
+    </div>
+    <div class="dn" id="dwNote"></div>
+    <div class="list" id="dwList"></div>
+  </aside>
   <div class="viewport" id="vp" tabindex="0">
     <div class="spacer" id="spacer"><div class="rows" id="rows"></div></div>
     <div class="empty" id="empty"><p>Connect your headset over USB (or Wi-Fi adb), pick it above and press Start. You can also drop a saved logcat file on the left.</p></div>
@@ -828,6 +873,7 @@ mark{background:color-mix(in srgb, var(--accent) 35%, transparent);color:inherit
     <div class="bar">
       <span class="meta" id="dMeta"></span>
       <button id="dContext" class="primary" title="Clear the search and show this line among everything around it (Enter or double-click a line)">Show in context</button>
+      <button id="dBm" title="Bookmark this line (B)">Bookmark</button>
       <button id="dCopy">Copy line</button>
       <button id="dOnlyTag">Show only this tag</button>
       <button id="dIgnoreTag">Ignore this tag</button>
@@ -862,7 +908,7 @@ const settings = Object.assign({
   buffers: "main,system,crash", clearFirst: false, serial: "", wifi: "",
   expScope: "selected", expFmt: "log",
   apps: [], appsOn: false, appFollow: true, appMention: true,
-  theme: "graphite", colorTags: true, tintRows: true, zebra: false, density: "normal", fontScale: 1, sideHidden: false, themeVer: 2
+  theme: "graphite", colorTags: true, tintRows: true, zebra: false, density: "normal", fontScale: 1, sideHidden: false, issuesAppOnly: true, themeVer: 2
 }, STORED);
 // one-time move from the old default (Ludus) to Graphite; a theme picked later is kept
 if(!STORED.themeVer && (STORED.theme === "ludus" || STORED.theme === "ludus-light")) settings.theme = "graphite";
@@ -1034,6 +1080,7 @@ function accept(e){
 }
 function rebuild(keepScroll){
   ignoredCount = 0;
+  try { drawerDirty = true; updateMarkCounts(); renderDrawer(); } catch {}   // the visible issues depend on the filters
   filtered = entries.filter(accept);
   if(focusId !== null && !filtered.some(e => e.id === focusId)) setFocus(null);
   anchorIdx = null;
@@ -1054,17 +1101,19 @@ function addLines(lines){
     const e = parseLine(raw);
     if(learn(e)) launched = true;
     entries.push(e);
+    detectIssue(e);
     lvlCount[e.lvl] = (lvlCount[e.lvl]||0) + 1;
     catCount[e.cat] = (catCount[e.cat]||0) + 1;
     if(accept(e)) filtered.push(e);
   }
   if(entries.length > MAX_LINES){
     entries = entries.slice(entries.length - Math.floor(MAX_LINES * 0.9));
-    recount(); rebuild(true);
+    pruneMarks(); recount(); rebuild(true);
   } else if(launched) rebuild(true);   // a newly watched app may have logged before it was launched
   if($("follow").checked && (atBottom || stickBottom)) stickBottom = true;
   $("empty").style.display = entries.length ? "none" : "";
   scheduleRender(); scheduleCounts();
+  if(drawerDirty){ updateMarkCounts(); renderDrawer(); }
 }
 
 // ------------------------------------------------------------------ rendering
@@ -1087,7 +1136,7 @@ function render(){
   let html = "";
   for(let i = start; i < end; i++){
     const e = filtered[i];
-    const cls = "row lvl-" + e.lvl + " cat-" + e.cat + (i & 1 ? " odd" : "") + (selected.has(e.id) ? " sel" : "") + (e.id === focusId ? " focus" : "") + (e.id === contextId ? " anchor" : "");
+    const cls = "row lvl-" + e.lvl + " cat-" + e.cat + (i & 1 ? " odd" : "") + (selected.has(e.id) ? " sel" : "") + (e.id === focusId ? " focus" : "") + (e.id === contextId ? " anchor" : "") + (bookmarks.has(e.id) ? " bm" : "");
     html += `<div class="${cls}" data-i="${i}"><div class="rail"></div><div class="ck"><i></i></div>` +
       `<div class="t">${e.t}</div><div class="p">${e.pid}${e.tid ? " / " + e.tid : ""}</div>` +
       `<div class="lv">${e.lvl}</div><div class="tg2" style="--h:${tagHue(e.tag)}" title="${esc(e.tag)}">${esc(e.tag)}</div>` +
@@ -1146,6 +1195,8 @@ function addIgnore(text){
 // ------------------------------------------------------------------ selection & detail
 function setFocus(id){
   focusId = id;
+  syncBmButton();
+  if(!$("drawer").hidden){ drawerDirty = true; renderDrawer(); }
   const e = id === null ? null : entries.find(x => x.id === id);
   if(!e){ $("detail").classList.add("hidden"); return; }
   $("detail").classList.remove("hidden");
@@ -1182,6 +1233,9 @@ document.addEventListener("keydown", ev => {
   if(typing) return;
   const mod = ev.ctrlKey || ev.metaKey;
   if(mod && ev.key.toLowerCase() === "a"){ ev.preventDefault(); $("selAll").click(); }
+  else if(ev.key === "F2"){ ev.preventDefault(); stepMarks("bm", ev.shiftKey ? -1 : 1); }
+  else if(ev.key === "F8"){ ev.preventDefault(); stepMarks("issues", ev.shiftKey ? -1 : 1); }
+  else if((ev.key === "b" || ev.key === "B") && !mod && !ev.altKey && focusId !== null){ ev.preventDefault(); toggleBookmark(focusId); }
   else if(ev.key === "Escape"){ $("selNone").click(); }
   else if(mod && ev.key.toLowerCase() === "c" && !window.getSelection().toString()){
     const list = selected.size ? entries.filter(e => selected.has(e.id)) : entries.filter(e => e.id === focusId);
@@ -1271,7 +1325,9 @@ function csvCell(s){ s = String(s ?? ""); return /[",\n\r]/.test(s) ? '"' + s.re
 function stamp(){ const d = new Date(), p = n => String(n).padStart(2,"0"); return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`; }
 $("export").onclick = () => {
   const scope = $("expScope").value, f = $("expFmt").value;
-  const list = scope === "selected" ? entries.filter(e => selected.has(e.id)) : scope === "filtered" ? filtered : entries;
+  const list = scope === "selected" ? entries.filter(e => selected.has(e.id)) : scope === "filtered" ? filtered
+             : scope === "bookmarked" ? entries.filter(e => bookmarks.has(e.id)) : entries;
+  if(!list.length && scope === "bookmarked"){ toast("No bookmarks yet. Select a line and press B."); return; }
   if(!list.length){ toast(scope === "selected" ? "No lines selected. Tick lines first, or choose “All shown lines”." : "Nothing to export yet."); return; }
   const catName = k => CATS.find(c => c[0] === k)[1];
   let body, mime;
@@ -1280,7 +1336,8 @@ $("export").onclick = () => {
       [e.d,e.t,e.pid,e.tid,e.lvl,e.tag,catName(e.cat),e.msg].map(csvCell).join(",")).join("\r\n");
     mime = "text/csv";
   } else if(f === "json"){
-    body = JSON.stringify(list.map(e => ({date:e.d, time:e.t, pid:e.pid, tid:e.tid, level:e.lvl, tag:e.tag, source:catName(e.cat), message:e.msg})), null, 2);
+    body = JSON.stringify(list.map(e => Object.assign({date:e.d, time:e.t, pid:e.pid, tid:e.tid, level:e.lvl, tag:e.tag, source:catName(e.cat), message:e.msg},
+      bookmarks.get(e.id) ? {note: bookmarks.get(e.id)} : {})), null, 2);
     mime = "application/json";
   } else { body = list.map(e => e.raw).join("\n") + "\n"; mime = "text/plain"; }
   const dev = ($("device").selectedOptions[0]?.dataset.model || "headset").replace(/[^\w-]+/g, "_");
@@ -1340,7 +1397,7 @@ $("start").onclick = async () => {
 };
 $("stop").onclick = async () => { applyStatus((await api("/api/stop", {})).status); };
 $("clearLogs").onclick = async () => {
-  entries = []; filtered = []; selected.clear(); ignoredCount = 0; setFocus(null);
+  entries = []; filtered = []; selected.clear(); ignoredCount = 0; setFocus(null); resetMarks();
   contextId = null; prevSearch = null; updateBack();
   recount(); updateCounts(); scheduleRender(); $("empty").style.display = "";
   try { await api("/api/clear", {}); } catch {}
@@ -1430,9 +1487,177 @@ $("appChips").addEventListener("click", ev => {
   else return;
   save(); compileApps(); renderApps(); rebuild(true);
 });
-$("appsOn").onchange = () => { settings.appsOn = $("appsOn").checked; save(); rebuild(true); };
+$("appsOn").onchange = () => { settings.appsOn = $("appsOn").checked; save(); rebuild(true); drawerDirty = true; updateMarkCounts(); renderDrawer(); };
 $("appFollow").onchange = () => { settings.appFollow = $("appFollow").checked; save(); };
 $("appMention").onchange = () => { settings.appMention = $("appMention").checked; save(); rebuild(true); };
+
+// ------------------------------------------------------------------ issues & bookmarks
+const ISSUE = {crash:"Crash", native:"Native crash", anr:"ANR", exception:"Exception", oom:"Out of memory",
+               died:"App died", lmk:"Low-memory kill", perf:"FPS drop"};
+let issues = [], issueByKey = new Map(), issueSeq = 0, lowFps = 0;
+const bookmarks = new Map();          // entry id -> note
+const crashByPid = new Map();         // pid -> crash issue, to pick up the exception line that follows
+let drawerTab = "issues", drawerDirty = true;
+const RE_EXC = /\b([A-Z]\w*(?:\.\w+)*(?:Exception|Error))\b/;
+const RE_DIED = /^Process (\S+) \(pid (\d+)\) has died/;
+const RE_LMK = /Kill(?:ing)? '?([\w.:]+)/;
+const RE_FPS = /^FPS=(\d+)\/(\d+)/;
+const normKey = s => s.replace(/0x[0-9a-f]+|\d+/gi, "#").slice(0, 140);
+const procOf = pid => pidName.get(pid) || "";
+function entryById(id){
+  if(!entries.length) return null;
+  const e = entries[id - entries[0].id];
+  return e && e.id === id ? e : entries.find(x => x.id === id) || null;
+}
+// group = true: identical problems (same text, numbers ignored) are counted on one issue
+function addIssue(kind, e, title, sub, group){
+  const key = group ? kind + "|" + normKey(title) : kind + "|" + e.id;
+  let it = issueByKey.get(key);
+  if(it){ it.count++; drawerDirty = true; return it; }
+  if(issues.length >= 2000) return null;
+  it = {id: ++issueSeq, kind, entryId: e.id, title: title.slice(0, 300), sub: (sub || "").slice(0, 300), time: e.t, pid: e.pid, count: 1, key};
+  issues.push(it); issueByKey.set(key, it); drawerDirty = true;
+  return it;
+}
+function detectIssue(e){
+  const m0 = e.msg;
+  if(e.tag === "AndroidRuntime"){
+    if(m0.startsWith("FATAL EXCEPTION")){
+      const it = addIssue("crash", e, "Java crash in {proc}", m0, false);
+      if(it) crashByPid.set(e.pid, it);
+    } else {
+      const c = crashByPid.get(e.pid);
+      if(c && !c.detailed && !m0.startsWith("Process:") && RE_EXC.test(m0)){ c.detailed = true; c.sub = m0.slice(0, 300); drawerDirty = true; }
+    }
+    return;
+  }
+  if(m0.includes("Fatal signal")){ addIssue("native", e, "Native crash in {proc}", m0, false); return; }
+  if((e.tag === "ActivityManager" || e.tag === "ActivityTaskManager") && m0.startsWith("ANR in")){ addIssue("anr", e, m0, "", false); return; }
+  if(e.tag === "ActivityManager"){
+    const m = RE_DIED.exec(m0);
+    if(m){ addIssue("died", e, "Process died: " + m[1], m0, false); return; }
+  }
+  if(/lowmemorykiller|lmkd/i.test(e.tag)){
+    const m = RE_LMK.exec(m0);
+    if(m){ addIssue("lmk", e, "Killed for low memory: " + m[1], m0, false); return; }
+  }
+  if(m0.includes("OutOfMemoryError")){ addIssue("oom", e, "OutOfMemoryError in {proc}", m0, true); return; }
+  if((e.tag === "Unity" || e.tag === "UnityMain") && (e.lvl === "E" || e.lvl === "F")){
+    const m = RE_EXC.exec(m0);
+    if(m && m[1].endsWith("Exception")){ addIssue("exception", e, m0, "", true); return; }
+  }
+  if(e.tag === "VrApi"){
+    const m = RE_FPS.exec(m0);
+    if(m){
+      const fps = +m[1], tgt = +m[2];
+      if(tgt && fps < 0.85 * tgt){ if(++lowFps === 3) addIssue("perf", e, `FPS ${fps}/${tgt} for 3+ seconds`, "", false); }
+      else lowFps = 0;
+    }
+  }
+}
+function issueVisible(it){
+  if(!appActive() || !settings.issuesAppOnly) return true;
+  const e = entryById(it.entryId);
+  return e ? appMatch(e) : true;
+}
+const visibleIssues = () => issues.filter(issueVisible);
+function pruneMarks(){
+  // drop issues and bookmarks whose lines were discarded to stay under the line limit
+  const first = entries.length ? entries[0].id : Infinity;
+  issues = issues.filter(it => it.entryId >= first);
+  issueByKey = new Map(issues.map(it => [it.key, it]));
+  for(const id of [...bookmarks.keys()]) if(id < first) bookmarks.delete(id);
+  crashByPid.clear(); drawerDirty = true;
+}
+function resetMarks(){
+  issues = []; issueByKey = new Map(); bookmarks.clear(); crashByPid.clear(); lowFps = 0; drawerDirty = true;
+  updateMarkCounts(); renderDrawer();
+}
+function updateMarkCounts(){
+  const n = visibleIssues().length;
+  $("issuesCnt").textContent = n;
+  $("issuesCnt").classList.toggle("hot", n > 0);
+  $("bmCnt").textContent = bookmarks.size;
+}
+function goToEntry(id){
+  if(!entryById(id)){ toast("That line is no longer in memory."); return; }
+  if(filtered.some(e => e.id === id)) scrollToEntry(id, 0.3);
+  else showInContext(id);
+}
+function stepMarks(kind, dir){
+  const ids = kind === "bm" ? [...bookmarks.keys()].sort((a, b) => a - b) : visibleIssues().map(it => it.entryId);
+  if(!ids.length){ toast(kind === "bm" ? "No bookmarks yet. Select a line and press B." : "No issues found so far."); return; }
+  const ref = focusId === null ? (dir > 0 ? -Infinity : Infinity) : focusId;
+  let target = dir > 0 ? ids.find(id => id > ref) : [...ids].reverse().find(id => id < ref);
+  if(target === undefined){ target = dir > 0 ? ids[0] : ids[ids.length - 1]; toast(dir > 0 ? "Back to the first one" : "Back to the last one"); }
+  goToEntry(target);
+}
+function toggleBookmark(id){
+  if(id === null) return;
+  if(bookmarks.has(id)){ bookmarks.delete(id); toast("Bookmark removed"); }
+  else { bookmarks.set(id, ""); toast("Bookmarked. Add a note from the Bookmarks list."); }
+  drawerDirty = true; updateMarkCounts(); renderDrawer(); scheduleRender(); syncBmButton();
+}
+function syncBmButton(){ $("dBm").textContent = focusId !== null && bookmarks.has(focusId) ? "Remove bookmark" : "Bookmark"; }
+function openDrawer(tab){ drawerTab = tab; $("drawer").hidden = false; drawerDirty = true; renderDrawer(); }
+function toggleDrawer(tab){ if(!$("drawer").hidden && drawerTab === tab) $("drawer").hidden = true; else openDrawer(tab); }
+function renderDrawer(){
+  if($("drawer").hidden || !drawerDirty) return;
+  drawerDirty = false;
+  $("tabIssues").setAttribute("aria-selected", drawerTab === "issues");
+  $("tabBm").setAttribute("aria-selected", drawerTab === "bm");
+  const list = $("dwList"), note = $("dwNote");
+  if(drawerTab === "issues"){
+    const vis = visibleIssues(), byKind = {};
+    vis.forEach(it => byKind[it.kind] = (byKind[it.kind] || 0) + it.count);
+    note.innerHTML = `<span>${vis.length ? Object.keys(byKind).map(k => `<span class="kb k-${k}">${byKind[k]} ${ISSUE[k]}</span>`).join(" ") : "No issues found so far."}</span>` +
+      (appActive() ? `<label class="chk" style="margin-left:auto"><input type="checkbox" id="dwAppOnly" ${settings.issuesAppOnly ? "checked" : ""}> Only selected apps</label>` : "");
+    list.innerHTML = vis.length ? vis.map(it => {
+      const proc = procOf(it.pid);
+      return `<div class="it${it.entryId === focusId ? " cur" : ""}" tabindex="0" data-id="${it.entryId}">` +
+        `<div class="top"><span class="kb k-${it.kind}">${ISSUE[it.kind]}</span><span class="when">${esc(it.time.slice(0, 8))}</span>${it.count > 1 ? `<span class="cnt">×${it.count}</span>` : ""}</div>` +
+        `<div class="ttl">${esc(it.title.replace("{proc}", proc || (it.pid ? "pid " + it.pid : "unknown process")))}</div>` +
+        (it.sub ? `<div class="sub">${esc(it.sub)}</div>` : (proc && !it.title.includes("{proc}") ? `<div class="sub">${esc(proc)}</div>` : "")) + `</div>`;
+    }).join("") : `<div class="empty2">Crashes, native crashes, ANRs, Unity exceptions, out-of-memory errors, apps that die or are killed for low memory, and FPS drops on Quest show up here as they happen.</div>`;
+  } else {
+    const ids = [...bookmarks.keys()].sort((a, b) => a - b);
+    note.innerHTML = `<span>${ids.length} bookmark${ids.length === 1 ? "" : "s"}</span>` +
+      (ids.length ? `<button id="dwBmExport" style="margin-left:auto">Export</button><button id="dwBmClear">Clear all</button>` : "");
+    list.innerHTML = ids.length ? ids.map(id => {
+      const e = entryById(id); if(!e) return "";
+      return `<div class="it${id === focusId ? " cur" : ""}" tabindex="0" data-id="${id}">` +
+        `<div class="top"><span class="when">${esc(e.t.slice(0, 12))}</span><span class="kb" style="color:var(--l-${e.lvl.toLowerCase()})">${e.lvl}</span><span>${esc(e.tag)}</span><button class="x" data-del="${id}" title="Remove bookmark">✕</button></div>` +
+        `<div class="ttl">${esc(e.msg.slice(0, 220))}</div>` +
+        `<input type="text" data-note="${id}" placeholder="Add a note…" value="${esc(bookmarks.get(id) || "")}"></div>`;
+    }).join("") : `<div class="empty2">Select a line and press <b>B</b> (or the Bookmark button in the line details) to keep it here. F2 and Shift+F2 jump between bookmarks.</div>`;
+  }
+}
+$("issuesBtn").onclick = () => toggleDrawer("issues");
+$("bmBtn").onclick = () => toggleDrawer("bm");
+$("tabIssues").onclick = () => openDrawer("issues");
+$("tabBm").onclick = () => openDrawer("bm");
+$("dwClose").onclick = () => { $("drawer").hidden = true; };
+$("dwNext").onclick = () => stepMarks(drawerTab, 1);
+$("dwPrev").onclick = () => stepMarks(drawerTab, -1);
+$("dBm").onclick = () => toggleBookmark(focusId);
+$("dwList").addEventListener("click", ev => {
+  if(ev.target.closest("input")) return;
+  const del = ev.target.closest("[data-del]");
+  if(del){ bookmarks.delete(+del.dataset.del); drawerDirty = true; updateMarkCounts(); renderDrawer(); scheduleRender(); syncBmButton(); return; }
+  const it = ev.target.closest(".it"); if(it) goToEntry(+it.dataset.id);
+});
+$("dwList").addEventListener("keydown", ev => {
+  const it = ev.target.closest(".it");
+  if(ev.key === "Enter" && it && !ev.target.closest("input")){ ev.preventDefault(); goToEntry(+it.dataset.id); }
+});
+$("dwList").addEventListener("input", ev => { const n = ev.target.dataset.note; if(n !== undefined) bookmarks.set(+n, ev.target.value); });
+$("dwNote").addEventListener("change", ev => {
+  if(ev.target.id === "dwAppOnly"){ settings.issuesAppOnly = ev.target.checked; save(); drawerDirty = true; updateMarkCounts(); renderDrawer(); }
+});
+$("dwNote").addEventListener("click", ev => {
+  if(ev.target.id === "dwBmExport"){ $("expScope").value = "bookmarked"; $("export").click(); }
+  if(ev.target.id === "dwBmClear"){ bookmarks.clear(); drawerDirty = true; updateMarkCounts(); renderDrawer(); scheduleRender(); syncBmButton(); toast("Bookmarks cleared"); }
+});
 
 // ------------------------------------------------------------------ appearance
 const THEMES = [

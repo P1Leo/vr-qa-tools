@@ -5,7 +5,7 @@ Solo usan la librería estándar de Python 3.8+ y adb.
 
 | Herramienta | Estado | Qué hace |
 | --- | --- | --- |
-| [`vr-log-inspector/`](vr-log-inspector/) | 1.5 | Visor de logcat en directo en el navegador: filtro por app, búsqueda, palabras ignoradas, contexto de una línea, exportación, temas y tamaño de texto. |
+| [`vr-log-inspector/`](vr-log-inspector/) | 1.6 | Visor de logcat en directo en el navegador: filtro por app, búsqueda, palabras ignoradas, detección de crashes y ANR, marcadores, contexto de una línea, exportación, temas y tamaño de texto. |
 | [`vr-session-recorder/`](vr-session-recorder/) | 0.1, en pruebas | Graba una sesión de bug (log, vídeo, métricas y marcadores) y la empaqueta en un zip con un informe HTML. |
 
 La documentación de uso de VR Log Inspector está en Notion. Los cambios de cada versión, en [CHANGELOG.md](CHANGELOG.md).

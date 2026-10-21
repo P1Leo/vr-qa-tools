@@ -2,6 +2,13 @@
 
 ## VR Log Inspector
 
+### 1.6 · 2026-10-21
+
+- **Lista de problemas (Issues):** detecta en directo, y también en logs abiertos desde archivo, crashes de Java (con la excepción que los causó), crashes nativos, ANR, excepciones de Unity, errores de memoria (OutOfMemoryError), apps que mueren o que el sistema cierra por falta de memoria, y caídas de FPS en Quest. Los problemas repetidos se agrupan con un contador. Con el filtro por app activo, muestra solo los de esas apps.
+- **Marcadores (Bookmarks):** marca líneas con **B** o con el botón del panel de detalle, añade una nota a cada una y exporta solo las marcadas (en .json, con sus notas).
+- Panel lateral con las dos listas: clic en un elemento para saltar a esa línea. **F8 / Mayús+F8** recorren los problemas y **F2 / Mayús+F2** los marcadores.
+- Nueva opción de exportación **Bookmarked lines**.
+
 ### 1.5 · 2026-10-21
 
 - **adb se instala solo:** si no está instalado, la página ofrece descargarlo de Google con un clic, con barra de progreso. Se guarda en una carpeta `platform-tools` junto a la herramienta, sin permisos de administrador ni cambios en el PATH. Si ya hay un adb en el PATH, se usa ese.
@@ -50,4 +57,4 @@
 ### 0.1 · 2026-10-21
 
 - Primera versión, en pruebas: graba a la vez logcat, vídeo (scrcpy o el grabador del visor), métricas de rendimiento y marcadores (notas, capturas, crashes, ANR, excepciones de Unity, caídas de FPS) y lo empaqueta en un zip con un informe HTML.
-- Aún no incluye las mejoras de VR Log Inspector 1.1–1.5 (temas, tamaño de texto, descarga automática de adb, lanzadores).
+- Aún no incluye las mejoras de VR Log Inspector 1.1–1.6 (temas, tamaño de texto, descarga automática de adb, lanzadores).
