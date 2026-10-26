@@ -28,7 +28,9 @@ jobs:
       - name: Contrast check
         run: python ../tools/check_contrast.py vr_log_inspector.py
       - name: Build normal and portable packages
-        run: python build_release.py --portable --out dist
+        # where installed copies look for updates: the UPDATE_SOURCE repository variable,
+        # or this repo's releases when it isn't set (users of a private repo then need a token)
+        run: python build_release.py --portable --out dist --update-source "${{ vars.UPDATE_SOURCE || format('github:{0}', github.repository) }}"
       - name: Release notes from CHANGELOG.md
         run: |
           python - <<'PY'
@@ -42,4 +44,9 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.zip --title "VR Log Inspector ${GITHUB_REF_NAME#log-inspector-v}" --notes-file notes.md
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.zip dist/latest.json --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.zip dist/latest.json --title "VR Log Inspector ${GITHUB_REF_NAME#log-inspector-v}" --notes-file notes.md
+          fi

@@ -36,7 +36,11 @@ exit /b 1
 :run
 echo Starting VR Log Inspector. Keep this window open while you use it; close it to stop the tool.
 echo.
+rem the tool exits with code 75 after installing an update: start the new version
+set "VRLI_LAUNCHER=1"
+:again
 "%PYEXE%" %PYARGS% "%~dp0vr_log_inspector.py" %*
+if "%ERRORLEVEL%"=="75" goto again
 if errorlevel 1 (
   echo.
   echo   VR Log Inspector stopped with an error. Read the message above.

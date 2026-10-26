@@ -17,8 +17,12 @@ if [ -z "$PY" ]; then
   exit 1
 fi
 echo "Starting VR Log Inspector. Keep this window open while you use it; close it to stop the tool."
-"$PY" vr_log_inspector.py "$@"
-status=$?
+export VRLI_LAUNCHER=1
+while true; do
+  "$PY" vr_log_inspector.py "$@"
+  status=$?
+  [ $status -eq 75 ] || break      # 75 = restart after an update
+done
 if [ $status -ne 0 ]; then
   echo
   echo "  VR Log Inspector stopped with an error. Read the message above."

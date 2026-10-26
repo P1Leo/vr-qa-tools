@@ -9,6 +9,13 @@ The normal package holds the script, the launchers and the README.
 The portable package (Windows) also includes the official "embeddable" Python from
 python.org, so it runs on a PC without Python installed: unzip and double-click.
 
+It also writes dist/latest.json, which a copy of the tool reads to find out about new versions.
+Publish it next to the normal zip wherever the update source points (see --update-source).
+
+    --update-source SRC  build the packages so they look for updates in SRC:
+                         a folder (shared drive or synced OneDrive/Google Drive/SharePoint folder),
+                         an https URL of latest.json, or github:OWNER/REPO (releases of this repo)
+
 Options for --portable:
     --python 3.14.8     Python version to embed (it must have an embeddable package on python.org)
     --arch amd64        amd64 (default) or arm64
@@ -18,7 +25,9 @@ Run it from the folder that contains vr_log_inspector.py. Needs internet only fo
 """
 
 import argparse
+import datetime
 import hashlib
+import json
 import io
 import os
 import re
@@ -54,6 +63,18 @@ def add_local(z, name, executable=False):
     if not os.path.isfile(path):
         sys.exit(f"Missing file: {name}")
     add_bytes(z, f"{TOP}/{name}", open(path, "rb").read(), executable)
+
+
+def changelog_notes(ver):
+    """The CHANGELOG.md section of this version, shown in the tool's update notice."""
+    for path in (os.path.join(HERE, "CHANGELOG.md"), os.path.join(HERE, "..", "CHANGELOG.md")):
+        if os.path.isfile(path):
+            text = open(path, encoding="utf-8").read()
+            part = text.split("## VR Log Inspector", 1)[-1].split("\n## ", 1)[0]
+            m = re.search(r"^### " + re.escape(ver) + r"\b.*?(?=^### |\Z)", part, re.M | re.S)
+            if m:
+                return m.group(0).strip()
+    return ""
 
 
 def download(url, label):
@@ -92,18 +113,29 @@ def main():
     ap.add_argument("--arch", default="amd64", choices=["amd64", "arm64"])
     ap.add_argument("--include-adb", action="store_true", help="put platform-tools inside the portable package")
     ap.add_argument("--out", default=os.path.join(HERE, "dist"))
+    ap.add_argument("--update-source", default="", help="where the packaged tool looks for updates")
     a = ap.parse_args()
 
     ver = tool_version()
     os.makedirs(a.out, exist_ok=True)
 
+    update_cfg = json.dumps({"source": a.update_source}, indent=2).encode() if a.update_source else None
     normal = os.path.join(a.out, f"VR_Log_Inspector_{ver}.zip")
     with zipfile.ZipFile(normal, "w") as z:
         for name in COMMON:
             add_local(z, name)
         for name in UNIX_LAUNCHERS:
             add_local(z, name, executable=True)
+        if update_cfg:
+            add_bytes(z, f"{TOP}/update.json", update_cfg)
     print(f"Built {normal}")
+    data = open(normal, "rb").read()
+    manifest = {"tool": "vr-log-inspector", "version": ver, "file": os.path.basename(normal),
+                "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
+                "published": datetime.date.today().isoformat(), "notes": changelog_notes(ver)}
+    with open(os.path.join(a.out, "latest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    print(f"Built {os.path.join(a.out, 'latest.json')}")
 
     if a.portable:
         py = download(PY_URL.format(ver=a.python, arch=a.arch), f"Python {a.python} embeddable ({a.arch}) from python.org")
@@ -114,6 +146,8 @@ def main():
             for name in COMMON:
                 add_local(z, name)
             copy_zip(z, py, f"{TOP}/python/", [r"python\.exe", r"python3\d+\._pth"])
+            if update_cfg:
+                add_bytes(z, f"{TOP}/update.json", update_cfg)
             if adb:
                 copy_zip(z, adb, f"{TOP}/", [r"platform-tools/adb\.exe"])
         print(f"Built {portable}")

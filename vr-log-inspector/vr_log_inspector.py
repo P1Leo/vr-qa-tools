@@ -25,7 +25,11 @@ import shutil
 import subprocess
 import sys
 import threading
+import hashlib
+import io
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 import zipfile
@@ -33,7 +37,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-TOOL_VERSION = "1.6"
+TOOL_VERSION = "1.8"
 ADB = None
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # hide console windows on Windows
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +46,10 @@ PLATFORM_TOOLS_URL = os.environ.get("VRLI_ADB_URL") or (
     "https://dl.google.com/android/repository/platform-tools-latest-"
     + {"win32": "windows", "darwin": "darwin"}.get(sys.platform, "linux") + ".zip")
 PLATFORM_TOOLS_PAGE = "https://developer.android.com/tools/releases/platform-tools"
+# logcat "-v long" marks exactly where each message starts, so multi-line messages
+# (Unity errors with their stack trace) can be kept together
+LONG_HEADER = re.compile(r"^\[ (\d\d-\d\d \d\d:\d\d:\d\d\.\d+)\s+(\d+):\s*(\d+) ([VDIWEFAS])/(.*?)\s*\]$")
+CONT = "\x1e"   # prefix sent to the page for continuation lines of a multi-line message
 ADB_STATE = {"state": "missing", "message": "", "path": "", "received": 0, "total": 0}
 ADB_LOCK = threading.Lock()
 
@@ -163,19 +171,165 @@ def run_adb(args, timeout=15):
 
 
 # --------------------------------------------------------------------------- buffer
+SESSIONS_DIR = ""
+SESSION_KEEP = 15          # newest autosaved sessions kept on disk
+SESSION_MAX_AGE = 14 * 86400
+
+
+def pick_sessions_dir():
+    for base in adb_download_dirs():
+        d = os.path.join(base, "sessions")
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".write-test")
+            open(probe, "w").close()
+            os.remove(probe)
+            return d
+        except OSError:
+            continue
+    return ""
+
+
+def session_path(name):
+    if not SESSIONS_DIR or not re.fullmatch(r"[\w.-]+", name or ""):
+        return None
+    return os.path.join(SESSIONS_DIR, name + ".session.log")
+
+
+def list_sessions():
+    out = []
+    if not SESSIONS_DIR:
+        return out
+    for fn in os.listdir(SESSIONS_DIR):
+        if not fn.endswith(".session.json"):
+            continue
+        try:
+            with open(os.path.join(SESSIONS_DIR, fn), encoding="utf-8") as f:
+                meta = json.load(f)
+            meta["name"] = fn[: -len(".session.json")]
+            if os.path.isfile(session_path(meta["name"])):
+                out.append(meta)
+        except (OSError, ValueError):
+            continue
+    return sorted(out, key=lambda m: m.get("updated", 0), reverse=True)
+
+
+def prune_sessions():
+    now = time.time()
+    for i, meta in enumerate(list_sessions()):
+        if i >= SESSION_KEEP or now - meta.get("updated", now) > SESSION_MAX_AGE:
+            for ext in (".session.log", ".session.json"):
+                try:
+                    os.remove(os.path.join(SESSIONS_DIR, meta["name"] + ext))
+                except OSError:
+                    pass
+
+
 class LineBuffer:
-    """Ring buffer of raw log lines with monotonically increasing ids."""
+    """Ring buffer of raw log lines with monotonically increasing ids.
+
+    While a session is open every line is also appended to a file on disk, so a
+    capture survives closing the tool, a crash or an update (see /api/sessions)."""
 
     def __init__(self, maxlen):
         self.lock = threading.Lock()
         self.lines = deque(maxlen=maxlen)
         self.next = 0
         self.epoch = int(time.time() * 1000)
+        self.session = ""
+        self.meta = {}
+        self.file = None
+        self.dirty = False
 
     def add(self, line):
         with self.lock:
             self.lines.append(line)
             self.next += 1
+            if self.file:
+                try:
+                    self.file.write(line + "\n")
+                    self.dirty = True
+                except (OSError, ValueError):
+                    self.file = None
+
+    def open_session(self, serial="", model=""):
+        """Start a new autosave file for the current (empty) buffer, unless one is already open."""
+        with self.lock:
+            if self.file or not SESSIONS_DIR:
+                return self.session
+            name = time.strftime("%Y%m%d_%H%M%S") + "_" + (re.sub(r"[^\w.-]+", "_", model or serial) or "headset")[:40]
+            try:
+                self.file = open(session_path(name), "a", encoding="utf-8", newline="\n")
+            except OSError:
+                return ""
+            self.session = name
+            self.meta = {"started": time.time(), "updated": time.time(), "serial": serial,
+                         "model": model, "lines": self.next, "version": TOOL_VERSION}
+            self._write_meta()
+            return name
+
+    def _write_meta(self):
+        try:
+            with open(os.path.join(SESSIONS_DIR, self.session + ".session.json"), "w", encoding="utf-8") as f:
+                json.dump(self.meta, f)
+        except OSError:
+            pass
+
+    def flush(self):
+        with self.lock:
+            if self.file and self.dirty:
+                try:
+                    self.file.flush()
+                except (OSError, ValueError):
+                    pass
+                self.dirty = False
+                self.meta.update(updated=time.time(), lines=self.next)
+                self._write_meta()
+
+    def close_session(self):
+        self.flush()
+        with self.lock:
+            if self.file:
+                try:
+                    self.file.close()
+                except OSError:
+                    pass
+            self.file = None
+
+    def last_timestamp(self):
+        """'MM-DD HH:MM:SS.mmm' of the newest line, to resume logcat right after it."""
+        with self.lock:
+            for line in reversed(self.lines):
+                m = re.match(r"^\x1e?(\d\d-\d\d \d\d:\d\d:\d\d\.\d+)", line)
+                if m:
+                    return m.group(1)
+        return ""
+
+    def load_session(self, name):
+        """Replace the buffer with a saved session and keep appending to it."""
+        path = session_path(name)
+        if not path or not os.path.isfile(path):
+            return False
+        self.close_session()
+        with self.lock:
+            self.lines.clear()
+            self.next = 0
+            self.epoch = int(time.time() * 1000)
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    self.lines.append(line.rstrip("\n"))
+                    self.next += 1
+            try:
+                with open(os.path.join(SESSIONS_DIR, name + ".session.json"), encoding="utf-8") as f:
+                    self.meta = json.load(f)
+            except (OSError, ValueError):
+                self.meta = {"started": time.time()}
+            self.session = name
+            try:
+                self.file = open(path, "a", encoding="utf-8", newline="\n")
+            except OSError:
+                self.file = None
+        return True
 
     def since(self, cursor, epoch, limit):
         with self.lock:
@@ -186,13 +340,195 @@ class LineBuffer:
             start = cursor - first
             out = list(itertools.islice(self.lines, start, start + limit))
             nxt = cursor + len(out)
-            return out, nxt, nxt < self.next, self.epoch
+            return out, nxt, nxt < self.next, self.epoch, self.session
 
     def clear(self):
+        self.close_session()        # the file stays on disk; a new capture starts a new session
         with self.lock:
             self.lines.clear()
             self.next = 0
             self.epoch = int(time.time() * 1000)
+            self.session = ""
+
+
+# --------------------------------------------------------------------------- updates
+# The update source is set in update.json next to this script ({"source": ...}), with
+# --update-source, or with the VRLI_UPDATE_SOURCE variable. It can be:
+#   * a folder (shared drive, OneDrive/Google Drive/SharePoint synced folder) with latest.json + the zip
+#   * an https URL of latest.json (the zip must sit next to it)
+#   * github:OWNER/REPO, reading latest.json from the newest log-inspector release.
+#     Private repos need a read-only token: "github_token" in update.json or VRLI_GITHUB_TOKEN.
+UPDATE = {"source": "", "token": "", "state": "idle", "message": "", "latest": None,
+          "checked": 0, "received": 0, "total": 0}
+UPDATE_LOCK = threading.Lock()
+RESTART = {"requested": False, "server": None}
+RESTART_CODE = 75                     # the launchers start the tool again when it exits with this code
+RESTART_MARKER = os.path.join(TOOL_DIR, ".restart.json")
+
+
+def load_update_config(cli_source):
+    cfg = {}
+    try:
+        with open(os.path.join(TOOL_DIR, "update.json"), encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        pass
+    UPDATE["source"] = (cli_source or os.environ.get("VRLI_UPDATE_SOURCE") or cfg.get("source") or "").strip()
+    UPDATE["token"] = (os.environ.get("VRLI_GITHUB_TOKEN") or cfg.get("github_token") or "").strip()
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:4]) or (0,)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def http_get(url, token="", accept="", progress=None):
+    """GET with optional GitHub token. Redirects are followed by hand without the token,
+    because GitHub sends asset downloads to storage that rejects it."""
+    headers = {"User-Agent": f"VR-Log-Inspector/{TOOL_VERSION}"}
+    if accept:
+        headers["Accept"] = accept
+    if token and urllib.parse.urlparse(url).hostname == "api.github.com":
+        headers["Authorization"] = f"Bearer {token}"
+    opener = urllib.request.build_opener(_NoRedirect)
+    for _ in range(5):
+        try:
+            resp = opener.open(urllib.request.Request(url, headers=headers), timeout=60)
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
+                url = urllib.parse.urljoin(url, e.headers["Location"])
+                headers.pop("Authorization", None)
+                continue
+            if e.code in (401, 403, 404) and "api.github.com" in url:
+                raise RuntimeError("GitHub refused the request: the repo is private or the token is missing, "
+                                   "wrong or expired (HTTP %d)" % e.code)
+            raise RuntimeError(f"HTTP {e.code} from {urllib.parse.urlparse(url).hostname}")
+        with resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            buf = io.BytesIO()
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                buf.write(chunk)
+                if progress:
+                    progress(buf.tell(), total)
+            return buf.getvalue()
+    raise RuntimeError("too many redirects")
+
+
+def read_manifest():
+    src, token = UPDATE["source"], UPDATE["token"]
+    if src.startswith("github:"):
+        repo = src[len("github:"):].strip("/")
+        releases = json.loads(http_get(f"https://api.github.com/repos/{repo}/releases?per_page=30", token))
+        for rel in releases:
+            if rel.get("draft") or not rel.get("tag_name", "").startswith("log-inspector-v"):
+                continue
+            assets = {a["name"]: a for a in rel.get("assets", [])}
+            if "latest.json" not in assets:
+                continue
+            man = json.loads(http_get(assets["latest.json"]["url"], token, "application/octet-stream"))
+            if man.get("file") not in assets:
+                raise RuntimeError(f"the release {rel['tag_name']} doesn't contain {man.get('file')}")
+            man["download"] = assets[man["file"]]["url"]
+            man["accept"] = "application/octet-stream"
+            return man
+        raise RuntimeError(f"no VR Log Inspector release with latest.json in {repo}")
+    if src.startswith(("http://", "https://")):
+        url = src if src.endswith(".json") else src.rstrip("/") + "/latest.json"
+        man = json.loads(http_get(url))
+        man["download"] = urllib.parse.urljoin(url, man["file"])
+        return man
+    folder = os.path.expanduser(src)
+    with open(os.path.join(folder, "latest.json"), encoding="utf-8") as f:
+        man = json.load(f)
+    man["download"] = os.path.join(folder, man["file"])
+    return man
+
+
+def check_update(force=False):
+    with UPDATE_LOCK:
+        if not UPDATE["source"]:
+            UPDATE.update(state="unconfigured", message="No update source is configured for this copy.")
+            return
+        if UPDATE["state"] in ("checking", "downloading", "installing", "restarting"):
+            return
+        if not force and time.time() - UPDATE["checked"] < 600:
+            return
+        UPDATE.update(state="checking", message="Checking for updates…")
+    try:
+        man = read_manifest()
+        newer = version_tuple(man.get("version")) > version_tuple(TOOL_VERSION)
+        UPDATE.update(latest={k: man.get(k) for k in ("version", "notes", "published", "file")},
+                      checked=time.time(), manifest=man,
+                      state="available" if newer else "current",
+                      message=f"Version {man.get('version')} is available." if newer else "You have the latest version.")
+    except Exception as e:
+        UPDATE.update(state="error", checked=time.time(), message=f"Couldn't check for updates: {e}")
+
+
+def apply_update():
+    man = UPDATE.get("manifest")
+    if not man or UPDATE["state"] != "available":
+        return
+    UPDATE.update(state="downloading", message="Downloading the update…", received=0, total=0)
+    try:
+        def prog(got, total):
+            UPDATE.update(received=got, total=total)
+        if os.path.isfile(man["download"]):
+            with open(man["download"], "rb") as f:
+                data = f.read()
+        else:
+            data = http_get(man["download"], UPDATE["token"], man.get("accept", ""), prog)
+        if man.get("sha256") and hashlib.sha256(data).hexdigest() != man["sha256"].lower():
+            raise RuntimeError("the download is damaged (checksum doesn't match). Nothing was changed")
+        UPDATE.update(state="installing", message="Installing…")
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            members = {os.path.basename(n): n for n in z.namelist() if not n.endswith("/")}
+            if "vr_log_inspector.py" not in members:
+                raise RuntimeError("the package doesn't contain vr_log_inspector.py")
+            new_src = z.read(members["vr_log_inspector.py"])
+            compile(new_src, "vr_log_inspector.py", "exec")      # refuse a broken file
+            ver = re.search(rb'^TOOL_VERSION = "([^"]+)"', new_src, re.M)
+            if not ver or ver.group(1).decode() != str(man.get("version")):
+                raise RuntimeError("the package version doesn't match the announced one")
+            readme = z.read(members["README.txt"]) if "README.txt" in members else None
+        # only the script and the README are replaced: the launchers may be running right now
+        me = os.path.abspath(__file__)
+        shutil.copy2(me, me + ".bak")
+        with open(me + ".new", "wb") as f:
+            f.write(new_src)
+        os.replace(me + ".new", me)
+        if readme is not None:
+            with open(os.path.join(TOOL_DIR, "README.txt"), "wb") as f:
+                f.write(readme)
+        UPDATE.update(state="restarting", message=f"Updated to {man['version']}. Restarting…")
+        request_restart()
+    except PermissionError:
+        UPDATE.update(state="error", message="Couldn't write the new version: this folder is read-only. "
+                                             "Move VR Log Inspector to a folder you can write to, or update it by hand.")
+    except Exception as e:
+        UPDATE.update(state="error", message=f"Update failed: {e}")
+
+
+def request_restart():
+    """Save what's needed to carry on, then stop the server; main() starts the new version."""
+    st = CAP.status()
+    marker = {"session": BUF.session, "capturing": st["running"] or st["reconnecting"],
+              "serial": st["serial"], "buffers": st["buffers"]}
+    try:
+        with open(RESTART_MARKER, "w", encoding="utf-8") as f:
+            json.dump(marker, f)
+    except OSError:
+        pass
+    RESTART["requested"] = True
+    if RESTART["server"]:
+        threading.Timer(0.8, RESTART["server"].shutdown).start()   # let the page get the answer first
 
 
 # --------------------------------------------------------------------------- capture
@@ -207,8 +543,10 @@ class Capture:
         self.message = "Not capturing. Pick a headset and press Start."
         self.procs = {}      # pid -> process name, latest snapshot from the headset
         self.procs_ver = 0
+        self.buffers = ""
+        self.reconnecting = False
 
-    def start(self, serial, clear_first, buffers):
+    def start(self, serial, clear_first, buffers, resume_from=""):
         self.stop(silent=True)
         if not ADB:
             with self.lock:
@@ -216,26 +554,70 @@ class Capture:
             return False
         if clear_first:
             run_adb((["-s", serial] if serial else []) + ["logcat", "-c"])
-        cmd = [ADB] + (["-s", serial] if serial else []) + ["logcat", "-v", "threadtime"]
+        model = ""
+        if not self.buf.session:
+            ok, out = run_adb((["-s", serial] if serial else []) + ["shell", "getprop ro.product.model"], 10)
+            model = out.strip() if ok else ""
+        self.buf.open_session(serial, model)
+        # continuing a capture (Restart, a recovered session, an update): only lines after the last one we have
+        resume_from = resume_from or self.buf.last_timestamp()
+        with self.lock:
+            self.gen += 1
+            gen = self.gen
+            self.serial, self.buffers = serial, buffers
+            self.reconnecting = False
+        if not self._spawn(serial, buffers, gen, resume_from):
+            return False
+        threading.Thread(target=self._track_procs, args=(serial, gen), daemon=True).start()
+        return True
+
+    def _spawn(self, serial, buffers, gen, since=""):
+        cmd = [ADB] + (["-s", serial] if serial else []) + ["logcat", "-v", "long"]
         if buffers:
             cmd += ["-b", buffers]
+        if since:
+            cmd += ["-T", since]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             with self.lock:
                 self.message = f"adb not found ('{ADB}'). Install platform-tools or pass --adb."
             return False
         with self.lock:
-            self.gen += 1
-            gen = self.gen
+            if gen != self.gen:
+                proc.terminate()
+                return False
             self.proc = proc
             self.running = True
-            self.serial = serial
             self.message = f"Capturing from {serial or 'default device'}"
         threading.Thread(target=self._reader, args=(proc, gen), daemon=True).start()
-        threading.Thread(target=self._track_procs, args=(serial, gen), daemon=True).start()
         return True
+
+    def _reconnect(self, gen):
+        """The headset went away (cable, sleep, Wi-Fi): wait for it and carry on where the log stopped."""
+        serial, buffers = self.serial, self.buffers
+        lost = time.time()
+        self.buf.add(f"--------- VR Log Inspector: connection lost at {time.strftime('%H:%M:%S')}, reconnecting")
+        while True:
+            with self.lock:
+                if gen != self.gen:
+                    return
+                self.reconnecting = True
+                self.message = f"Connection lost. Reconnecting… ({int(time.time() - lost)} s). Press Stop to give up."
+            if serial and ":" in serial:      # Wi-Fi adb
+                run_adb(["connect", serial], 10)
+            ok, out = run_adb((["-s", serial] if serial else []) + ["get-state"], 10)
+            if ok and out.strip().endswith("device"):
+                break
+            time.sleep(2)
+        since = self.buf.last_timestamp()
+        self.buf.add(f"--------- VR Log Inspector: reconnected at {time.strftime('%H:%M:%S')} after {int(time.time() - lost)} s")
+        with self.lock:
+            if gen != self.gen:
+                return
+            self.reconnecting = False
+        self._spawn(serial, buffers, gen, since)
 
     def _track_procs(self, serial, gen):
         """Every 2 s, read which process name owns each PID, so the UI can filter by app."""
@@ -264,22 +646,63 @@ class Capture:
             return (self.procs, self.procs_ver) if ver != self.procs_ver else (None, self.procs_ver)
 
     def _reader(self, proc, gen):
+        """Read logcat -v long and turn every message into threadtime-style lines.
+
+        The first line of a message is sent as is; the following lines of the same
+        message get the CONT prefix. Trailing blank lines of a message are dropped.
+        A message is complete when the next header arrives, or after a short pause.
+        """
+        state = {"head": None, "lines": [], "last": 0.0}
+        lock = threading.Lock()
+
+        def flush():
+            head, lines = state["head"], state["lines"]
+            if head is None:
+                return
+            while lines and not lines[-1].strip():
+                lines.pop()
+            for i, msg in enumerate(lines or [""]):
+                self.buf.add((CONT if i else "") + head + msg)
+            state["head"], state["lines"] = None, []
+
+        def flush_when_idle():
+            while proc.poll() is None:
+                time.sleep(0.2)
+                with lock:
+                    if state["head"] is not None and time.time() - state["last"] > 0.3:
+                        flush()
+
+        threading.Thread(target=flush_when_idle, daemon=True).start()
         for raw in iter(proc.stdout.readline, b""):
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
-            if line:
-                self.buf.add(line)
+            with lock:
+                state["last"] = time.time()
+                m = LONG_HEADER.match(line)
+                if m:
+                    flush()
+                    when, pid, tid, lvl, tag = m.groups()
+                    state["head"] = f"{when} {int(pid):5d} {int(tid):5d} {lvl} {tag:<8}: "
+                elif line.startswith("--------- "):
+                    flush()
+                    self.buf.add(line)
+                elif state["head"] is not None:
+                    state["lines"].append(line)
+                elif line:
+                    self.buf.add(line)   # e.g. adb errors before the first message
+        with lock:
+            flush()
         proc.wait()
         with self.lock:
-            if gen == self.gen:
-                self.running = False
-                self.message = (f"logcat ended (exit code {proc.returncode}). "
-                                "Check the headset is connected and authorized, then press Start.")
+            current = gen == self.gen and self.proc is proc
+        if current:
+            threading.Thread(target=self._reconnect, args=(gen,), daemon=True).start()
 
     def stop(self, silent=False):
         with self.lock:
             self.gen += 1
             proc, self.proc = self.proc, None
             self.running = False
+            self.reconnecting = False
             if not silent:
                 self.message = "Stopped."
         if proc and proc.poll() is None:
@@ -291,7 +714,36 @@ class Capture:
 
     def status(self):
         with self.lock:
-            return {"running": self.running, "serial": self.serial, "message": self.message}
+            return {"running": self.running, "serial": self.serial, "message": self.message,
+                    "reconnecting": self.reconnecting, "buffers": self.buffers}
+
+
+def device_info(serial, pkgs):
+    pre = ["-s", serial] if serial else []
+    ok, out = run_adb(pre + ["shell", "getprop"], 15)
+    if not ok:
+        return {"ok": False, "error": out}
+    props = dict(re.findall(r"^\[([^\]]+)\]: \[([^\]]*)\]", out, re.M))
+    ok, bat = run_adb(pre + ["shell", "dumpsys battery"], 10)
+    level = re.search(r"^\s*level:\s*(\d+)", bat, re.M)
+    temp = re.search(r"^\s*temperature:\s*(\d+)", bat, re.M)
+    apps = []
+    for pkg in pkgs[:10]:
+        if not re.fullmatch(r"[A-Za-z]\w*(\.\w+)+", pkg):
+            continue
+        ok, dump = run_adb(pre + ["shell", f"dumpsys package {pkg}"], 15)
+        vn = re.search(r"versionName=(\S+)", dump)
+        vc = re.search(r"versionCode=(\d+)", dump)
+        apps.append({"pkg": pkg, "version": vn.group(1) if vn else "", "code": vc.group(1) if vc else "",
+                     "installed": bool(vn or vc)})
+    return {"ok": True, "serial": serial,
+            "manufacturer": props.get("ro.product.manufacturer", ""),
+            "model": props.get("ro.product.model", ""),
+            "build": props.get("ro.build.display.id", ""),
+            "android": props.get("ro.build.version.release", ""),
+            "battery": int(level.group(1)) if level else None,
+            "bat_temp": int(temp.group(1)) / 10 if temp else None,
+            "apps": apps}
 
 
 def list_apps(serial):
@@ -372,10 +824,23 @@ class Handler(BaseHTTPRequestHandler):
             cursor = int(q.get("since", ["0"])[0] or 0)
             epoch = int(q.get("epoch", ["0"])[0] or 0)
             pver = int(q.get("pver", ["-1"])[0] or -1)
-            lines, nxt, more, ep = BUF.since(cursor, epoch, 20000)
+            lines, nxt, more, ep, session = BUF.since(cursor, epoch, 20000)
             procs, ver = CAP.procs_since(pver)
-            return self._json({"lines": lines, "next": nxt, "more": more, "epoch": ep,
-                               "status": CAP.status(), "procs": procs, "pver": ver})
+            return self._json({"lines": lines, "next": nxt, "more": more, "epoch": ep, "session": session,
+                               "status": CAP.status(), "procs": procs, "pver": ver, "version": TOOL_VERSION})
+        if url.path == "/api/info":
+            pkgs = [p for p in q.get("pkgs", [""])[0].split(",") if p]
+            return self._json(device_info(q.get("serial", [""])[0], pkgs))
+        if url.path == "/api/sessions":
+            allsess = list_sessions()
+            return self._json({"sessions": allsess[:10], "all": [x["name"] for x in allsess],
+                               "current": BUF.session, "dir": SESSIONS_DIR})
+        if url.path == "/api/update":
+            if q.get("check", [""])[0]:
+                threading.Thread(target=check_update, args=(q["check"][0] == "force",), daemon=True).start()
+            out = {k: UPDATE[k] for k in ("source", "state", "message", "latest", "received", "total")}
+            out["current"] = TOOL_VERSION
+            return self._json(out)
         self._send(404, "not found", "text/plain")
 
     def do_POST(self):
@@ -393,7 +858,20 @@ class Handler(BaseHTTPRequestHandler):
             CAP.stop()
             return self._json({"ok": True, "status": CAP.status()})
         if path == "/api/clear":
+            running = CAP.status()["running"]
             BUF.clear()
+            if running:          # keep autosaving what comes next in a new session
+                BUF.open_session(CAP.serial)
+            return self._json({"ok": True})
+        if path == "/api/sessions/load":
+            st = CAP.status()
+            if st["running"] or st["reconnecting"]:
+                return self._json({"ok": False, "error": "Stop the capture before opening a saved session."})
+            ok = BUF.load_session(str(body.get("name", "")))
+            return self._json({"ok": ok, "error": "" if ok else "That session no longer exists."})
+        if path == "/api/update/apply":
+            if UPDATE["state"] == "available":
+                threading.Thread(target=apply_update, daemon=True).start()
             return self._json({"ok": True})
         if path == "/api/connect":
             addr = str(body.get("addr", "")).strip()
@@ -413,7 +891,24 @@ def main():
     ap.add_argument("--adb", default=None, help="path to adb executable")
     ap.add_argument("--buffer", type=int, default=500000, help="max lines kept in memory")
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--update-source", default=None,
+                    help="where to look for new versions: a folder, an https URL of latest.json, or github:OWNER/REPO")
     args = ap.parse_args()
+    global SESSIONS_DIR
+    SESSIONS_DIR = pick_sessions_dir()
+    prune_sessions()
+    load_update_config(args.update_source)
+    restarted = None
+    if os.path.isfile(RESTART_MARKER):          # we are the new version started after an update
+        try:
+            with open(RESTART_MARKER, encoding="utf-8") as f:
+                restarted = json.load(f)
+        except (OSError, ValueError):
+            restarted = {}
+        try:
+            os.remove(RESTART_MARKER)
+        except OSError:
+            pass
 
     ADB = find_adb(args.adb)
     if ADB and (os.path.isfile(ADB) or shutil.which(ADB)):
@@ -424,20 +919,52 @@ def main():
     BUF = LineBuffer(args.buffer)
     CAP = Capture(BUF)
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server = None
+    for attempt in range(40):                    # after a restart the old process may still hold the port
+        try:
+            server = ThreadingHTTPServer((args.host, args.port), Handler)
+            break
+        except OSError:
+            if restarted is None or attempt == 39:
+                raise
+            time.sleep(0.25)
+    RESTART["server"] = server
     url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '') else args.host}:{args.port}/"
     print(f"VR Log Inspector {TOOL_VERSION} running at {url}")
     print(f"  adb: {ADB or 'not found yet - the page will offer to download it'}")
+    print(f"  sessions are autosaved in: {SESSIONS_DIR or 'nowhere (no writable folder)'}")
+    print(f"  updates: {UPDATE['source'] or 'no update source configured'}")
     print("Press Ctrl+C to quit.")
-    if not args.no_browser:
+
+    if restarted is not None:
+        print("Restarted after an update.")
+        if restarted.get("session") and BUF.load_session(restarted["session"]) and restarted.get("capturing") and ADB:
+            CAP.start(restarted.get("serial", ""), False, restarted.get("buffers", ""))
+    elif not args.no_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+
+    def autosave():
+        while True:
+            time.sleep(1)
+            BUF.flush()
+    threading.Thread(target=autosave, daemon=True).start()
+    if UPDATE["source"]:
+        threading.Timer(3, check_update).start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         CAP.stop(silent=True)
+        BUF.close_session()
         server.server_close()
+    if RESTART["requested"]:
+        print("Starting the new version…")
+        if os.environ.get("VRLI_LAUNCHER"):
+            sys.exit(RESTART_CODE)               # the launcher runs the tool again
+        subprocess.Popen([sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+        sys.exit(0)
 
 
 # --------------------------------------------------------------------------- UI
@@ -679,6 +1206,22 @@ mark{background:color-mix(in srgb, var(--accent) 35%, transparent);color:inherit
 .prog{flex:1 1 200px;height:8px;border-radius:99px;background:var(--panel-2);overflow:hidden;min-width:120px}
 .prog i{display:block;height:100%;width:0;background:var(--accent);transition:width .25s ease}
 @media (prefers-reduced-motion: reduce){.prog i{transition:none}}
+.devline{flex-basis:100%;display:flex;flex-wrap:wrap;gap:4px 14px;color:var(--muted);font-size:calc(12px * var(--fs));padding-top:2px}
+.devline[hidden]{display:none}
+.devline b{color:var(--text);font-weight:600}
+.dot.warn{background:var(--l-w);box-shadow:0 0 0 3px color-mix(in srgb, var(--l-w) 25%, transparent)}
+.adbbar pre{flex-basis:100%;margin:0;max-height:220px;overflow:auto;white-space:pre-wrap;font:calc(12px * var(--fs))/1.5 var(--ui);color:var(--text);
+  background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.sessl{display:flex;flex-direction:column;gap:5px;margin-top:8px}
+.sessl .s{display:flex;align-items:center;gap:8px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--panel-2)}
+.sessl .s div{flex:1;min-width:0}
+.sessl .s b{display:block;font-weight:600;font-size:calc(12.5px * var(--fs));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sessl .s small{color:var(--muted)}
+.sessl .s.cur{border-color:var(--accent)}
+.noise .bar{height:4px;border-radius:2px;background:var(--accent);margin-top:5px;opacity:.7}
+.noise .acts{display:flex;gap:6px;margin-top:6px}
+.noise .acts button{padding:2px 9px;font-size:calc(12px * var(--fs))}
+.updline{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin-top:8px;color:var(--muted);font-size:calc(12px * var(--fs))}
 .appear{position:absolute;right:12px;top:calc(100% + 6px);width:calc(340px * var(--fs));max-width:calc(100vw - 24px);background:var(--panel);border:1px solid var(--line);
   border-radius:var(--radius);padding:14px;box-shadow:0 12px 32px rgba(0,0,0,.35);z-index:20}
 .appear[hidden]{display:none}
@@ -755,6 +1298,21 @@ mark{background:color-mix(in srgb, var(--accent) 35%, transparent);color:inherit
       <button data-d="compact" aria-pressed="false">Compact</button><button data-d="normal" aria-pressed="false">Normal</button><button data-d="comfy" aria-pressed="false">Roomy</button>
     </div>
     <p style="margin:14px 0 0;color:var(--muted);font-size:calc(11.5px * var(--fs))">VR Log Inspector __VERSION__</p>
+    <div class="updline"><button id="updCheck">Check for updates</button><span id="updState"></span></div>
+  </div>
+  <div class="devline" id="devLine" hidden></div>
+  <div class="adbbar" id="updBar" role="status" aria-live="polite" hidden>
+    <div class="txt" id="updTxt"></div>
+    <div class="prog" id="updProg" hidden><i id="updFill"></i></div>
+    <button id="updNotesBtn">What's new</button>
+    <button class="primary" id="updGo">Update now</button>
+    <button id="updLater">Later</button>
+    <pre id="updNotes" hidden></pre>
+  </div>
+  <div class="adbbar" id="recBar" role="status" hidden>
+    <div class="txt" id="recTxt"></div>
+    <button class="primary" id="recGo">Open it</button>
+    <button id="recNo">Dismiss</button>
   </div>
   <div class="adbbar" id="adbBar" role="status" aria-live="polite" hidden>
     <div class="txt" id="adbTxt"></div>
@@ -805,7 +1363,8 @@ mark{background:color-mix(in srgb, var(--accent) 35%, transparent);color:inherit
     </div>
     <div class="chips" id="chips"></div>
     <label class="chk" style="margin-top:8px"><input type="checkbox" id="ignoreOn" checked> Apply ignore list</label>
-    <p class="hint">Click a keyword to pause it without deleting. The list is saved in this browser.</p>
+    <label class="chk" style="margin-top:4px"><input type="checkbox" id="hideEmpty" checked> Hide lines with an empty message</label>
+    <p class="hint">Ignoring a message also hides the rest of it (stack trace and blank lines). Click a keyword to pause it without deleting. The list is saved in this browser.</p>
   </div>
 
   <details>
@@ -822,6 +1381,12 @@ mark{background:color-mix(in srgb, var(--accent) 35%, transparent);color:inherit
     <h2>Open a saved log</h2>
     <div class="drop" id="drop">Drop a .txt / .log file here or <button id="pick" type="button">choose a file</button></div>
     <input type="file" id="file" accept=".txt,.log,.logcat,text/plain" hidden multiple>
+  </div>
+
+  <div>
+    <h2>Recent sessions</h2>
+    <p class="hint" style="margin-top:0">Every capture is saved automatically, so closing the tool, a crash or an update doesn't lose it.</p>
+    <div class="sessl" id="sessList"></div>
   </div>
 </aside>
 
@@ -843,6 +1408,7 @@ mark{background:color-mix(in srgb, var(--accent) 35%, transparent);color:inherit
       <option value="json">.json</option>
     </select>
     <button id="export" class="primary">Export</button>
+    <button id="bugBtn" title="Copy a summary for a bug report: device, app versions, issues found and bookmarked lines">Copy bug summary</button>
     <label class="chk" title="Keep the newest line in view"><input type="checkbox" id="follow" checked> Follow</label>
     <button id="clearLogs" class="danger" title="Clear the lines in this viewer">Clear</button>
     <button id="sideBtn" aria-controls="side" aria-expanded="true" title="Show or hide the filter panel">Hide filters</button>
@@ -857,6 +1423,7 @@ mark{background:color-mix(in srgb, var(--accent) 35%, transparent);color:inherit
       <div class="tabs" role="tablist">
         <button role="tab" id="tabIssues" aria-selected="true">Issues</button>
         <button role="tab" id="tabBm" aria-selected="false">Bookmarks</button>
+        <button role="tab" id="tabNoise" aria-selected="false" title="The messages that repeat the most">Noise</button>
       </div>
       <button id="dwPrev" title="Previous (Shift+F8 / Shift+F2)">↑</button>
       <button id="dwNext" title="Next (F8 / F2)">↓</button>
@@ -908,14 +1475,14 @@ const settings = Object.assign({
   buffers: "main,system,crash", clearFirst: false, serial: "", wifi: "",
   expScope: "selected", expFmt: "log",
   apps: [], appsOn: false, appFollow: true, appMention: true,
-  theme: "graphite", colorTags: true, tintRows: true, zebra: false, density: "normal", fontScale: 1, sideHidden: false, issuesAppOnly: true, themeVer: 2
+  theme: "graphite", colorTags: true, tintRows: true, zebra: false, density: "normal", fontScale: 1, sideHidden: false, issuesAppOnly: true, hideEmpty: true, themeVer: 2
 }, STORED);
 // one-time move from the old default (Ludus) to Graphite; a theme picked later is kept
 if(!STORED.themeVer && (STORED.theme === "ludus" || STORED.theme === "ludus-light")) settings.theme = "graphite";
 function save(){ try { localStorage.setItem(STORE, JSON.stringify(settings)); } catch {} }
 
 // ------------------------------------------------------------------ state
-let entries = [], filtered = [], seq = 0;
+let entries = [], filtered = [], seq = 0, prevEntry = null;
 const selected = new Set();
 let focusId = null, anchorIdx = null;
 let ignoredCount = 0;
@@ -943,6 +1510,8 @@ function categorize(tag){
   return c;
 }
 function parseLine(raw){
+  const cont = raw.charCodeAt(0) === 30;   // continuation line of a multi-line message (see the server)
+  if(cont) raw = raw.slice(1);
   let m = RE_THREADTIME.exec(raw), e;
   if(m) e = {d:m[1], t:m[2], pid:m[3], tid:m[4], lvl:m[5], tag:m[6].trim(), msg:m[7]};
   else if((m = RE_BRIEF.exec(raw))) e = {d:"", t:"", pid:m[3], tid:"", lvl:m[1], tag:m[2].trim(), msg:m[4]};
@@ -950,6 +1519,8 @@ function parseLine(raw){
   if(e.lvl === "A") e.lvl = "F";
   if(e.lvl === "S") e.lvl = "V";
   e.id = seq++; e.raw = raw;
+  e.head = cont && prevEntry ? (prevEntry.head || prevEntry) : null;   // first line of the same message
+  prevEntry = e;
   e.lc = (e.tag + " " + e.msg).toLowerCase();
   e.cat = categorize(e.tag);
   return e;
@@ -1030,7 +1601,7 @@ function addApp(pkg, via){
   if(settings.apps.some(a => a.pkg === pkg)){ toast(pkg + " is already in the list"); return false; }
   settings.apps.push({pkg, on: true, via: via || ""});
   if(!via && !settings.appsOn){ settings.appsOn = true; $("appsOn").checked = true; }
-  save(); compileApps(); renderApps();
+  save(); compileApps(); renderApps(); loadInfo();
   toast(via ? `Now also watching ${pkg} (launched by ${via})` : `Showing logs from ${pkg}`);
   return true;
 }
@@ -1067,7 +1638,12 @@ async function loadApps(){
   } catch { return null; }
 }
 
-function isIgnored(e){ return settings.ignoreOn && ignoreTests.length && ignoreTests.some(f => f(e)); }
+function isIgnored(e){
+  if(settings.hideEmpty && !e.msg.trim()) return true;
+  if(!settings.ignoreOn || !ignoreTests.length) return false;
+  // ignoring a message also hides the rest of it: stack trace, "(Filename: ...)" and blank lines
+  return ignoreTests.some(f => f(e)) || (e.head !== null && ignoreTests.some(f => f(e.head)));
+}
 function passes(e){
   if(!appMatch(e)) return false;
   if(!levelOn.has(e.lvl) || !catOn.has(e.cat)) return false;
@@ -1093,13 +1669,18 @@ function recount(){
 }
 
 // ------------------------------------------------------------------ adding lines
-function addLines(lines){
+function addLines(lines, baseSid){
   const vp = $("vp");
   const atBottom = vp.scrollTop + vp.clientHeight >= vp.scrollHeight - ROW_H * 2;
-  let launched = false;
+  let launched = false, k = 0;
   for(const raw of lines){
     const e = parseLine(raw);
     if(learn(e)) launched = true;
+    if(baseSid !== undefined){
+      e.sid = baseSid + k;
+      if(bmStore[e.sid] !== undefined){ bookmarks.set(e.id, bmStore[e.sid]); drawerDirty = true; }
+    }
+    k++;
     entries.push(e);
     detectIssue(e);
     lvlCount[e.lvl] = (lvlCount[e.lvl]||0) + 1;
@@ -1336,10 +1917,18 @@ $("export").onclick = () => {
       [e.d,e.t,e.pid,e.tid,e.lvl,e.tag,catName(e.cat),e.msg].map(csvCell).join(",")).join("\r\n");
     mime = "text/csv";
   } else if(f === "json"){
-    body = JSON.stringify(list.map(e => Object.assign({date:e.d, time:e.t, pid:e.pid, tid:e.tid, level:e.lvl, tag:e.tag, source:catName(e.cat), message:e.msg},
-      bookmarks.get(e.id) ? {note: bookmarks.get(e.id)} : {})), null, 2);
+    body = JSON.stringify({tool: "VR Log Inspector " + VERSION, exported: new Date().toISOString(),
+      device: devInfo ? {manufacturer: devInfo.manufacturer, model: devInfo.model, build: devInfo.build, android: devInfo.android, serial: devInfo.serial} : null,
+      apps: devInfo ? devInfo.apps : [],
+      lines: list.map(e => Object.assign({date:e.d, time:e.t, pid:e.pid, tid:e.tid, level:e.lvl, tag:e.tag, source:catName(e.cat), message:e.msg},
+        bookmarks.get(e.id) ? {note: bookmarks.get(e.id)} : {}))}, null, 2);
     mime = "application/json";
-  } else { body = list.map(e => e.raw).join("\n") + "\n"; mime = "text/plain"; }
+  } else {
+    // "--------- " lines are logcat's own separators: other tools and this one skip them when reading
+    const head = [`--------- VR Log Inspector ${VERSION} export, ${new Date().toLocaleString()}`];
+    if(devInfo) head.push("--------- Device: " + deviceText(), ...(devInfo.apps.length ? ["--------- Apps: " + appsText()] : []));
+    body = head.concat(list.map(e => e.raw)).join("\n") + "\n"; mime = "text/plain";
+  }
   const dev = ($("device").selectedOptions[0]?.dataset.model || "headset").replace(/[^\w-]+/g, "_");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([body], {type: mime}));
@@ -1371,16 +1960,21 @@ async function refreshDevices(){
   } catch { setStatus("off", "Local server is not running. Start vr_log_inspector.py again."); }
 }
 function setStatus(kind, text){
-  $("dot").className = "dot" + (kind === "on" ? " on" : kind === "off" ? " off" : "");
+  $("dot").className = "dot" + (kind === "on" ? " on" : kind === "off" ? " off" : kind === "warn" ? " warn" : "");
   $("statusText").textContent = text; $("status").title = text;
 }
+let wasRunning = false;
 function applyStatus(s){
-  setStatus(s.running ? "on" : "", s.message);
-  $("start").disabled = !adbReady; $("stop").disabled = !s.running;
-  $("start").textContent = s.running ? "Restart" : "Start";
+  const active = s.running || s.reconnecting;
+  setStatus(s.reconnecting ? "warn" : s.running ? "on" : "", s.message);
+  $("start").disabled = !adbReady; $("stop").disabled = !active;
+  $("start").textContent = active ? "Restart" : "Start";
+  if(s.running && !wasRunning) loadInfo();
+  if(!active && wasRunning) loadSessions();
+  wasRunning = active;
 }
 $("refresh").onclick = refreshDevices;
-$("device").onchange = () => { settings.serial = $("device").value; save(); loadApps(); };
+$("device").onchange = () => { settings.serial = $("device").value; save(); loadApps(); devInfo = null; renderInfo(); loadInfo(); };
 $("buffers").onchange = () => { settings.buffers = $("buffers").value; save(); };
 $("clearFirst").onchange = () => { settings.clearFirst = $("clearFirst").checked; save(); };
 $("connect").onclick = async () => {
@@ -1397,7 +1991,7 @@ $("start").onclick = async () => {
 };
 $("stop").onclick = async () => { applyStatus((await api("/api/stop", {})).status); };
 $("clearLogs").onclick = async () => {
-  entries = []; filtered = []; selected.clear(); ignoredCount = 0; setFocus(null); resetMarks();
+  entries = []; filtered = []; selected.clear(); ignoredCount = 0; prevEntry = null; setFocus(null); resetMarks();
   contextId = null; prevSearch = null; updateBack();
   recount(); updateCounts(); scheduleRender(); $("empty").style.display = "";
   try { await api("/api/clear", {}); } catch {}
@@ -1407,15 +2001,17 @@ let online = true;
 async function poll(){
   try {
     const j = await api(`/api/logs?since=${cursor}&epoch=${epoch}&pver=${pver}`);
+    if(j.version && j.version !== VERSION){ location.reload(); return; }   // updated and restarted
     epoch = j.epoch; cursor = j.next;
-    if(j.lines.length) addLines(j.lines);
+    if(j.session !== session){ session = j.session || ""; loadBmStore(); }
+    if(j.lines.length) addLines(j.lines, j.next - j.lines.length);
     if(j.procs){ pver = j.pver; mergeProcs(j.procs); }
     if(!online){ online = true; }
     applyStatus(j.status);
     if(j.more) return setTimeout(poll, 0);
   } catch {
     online = false;
-    setStatus("off", "Local server stopped. Run vr_log_inspector.py again to keep capturing.");
+    setStatus("off", updState === "restarting" ? "Restarting with the new version…" : "Local server stopped. Run vr_log_inspector.py again to keep capturing.");
     $("start").disabled = $("stop").disabled = true;
   }
   setTimeout(poll, 300);
@@ -1460,6 +2056,7 @@ $("chips").addEventListener("click", ev => {
   save(); compileIgnore(); renderChips(); rebuild(true);
 });
 $("ignoreOn").onchange = () => { settings.ignoreOn = $("ignoreOn").checked; save(); rebuild(true); };
+$("hideEmpty").onchange = () => { settings.hideEmpty = $("hideEmpty").checked; save(); rebuild(true); };
 
 function onRules(){
   settings.unityTags = $("unityTags").value; settings.xrTags = $("xrTags").value; save();
@@ -1520,6 +2117,7 @@ function addIssue(kind, e, title, sub, group){
   return it;
 }
 function detectIssue(e){
+  if(e.head && e.tag !== "AndroidRuntime") return;
   const m0 = e.msg;
   if(e.tag === "AndroidRuntime"){
     if(m0.startsWith("FATAL EXCEPTION")){
@@ -1594,11 +2192,16 @@ function stepMarks(kind, dir){
 }
 function toggleBookmark(id){
   if(id === null) return;
-  if(bookmarks.has(id)){ bookmarks.delete(id); toast("Bookmark removed"); }
+  if(bookmarks.has(id)){ bookmarks.delete(id); saveBmStore(); toast("Bookmark removed"); }
   else { bookmarks.set(id, ""); toast("Bookmarked. Add a note from the Bookmarks list."); }
+  saveBmStore();
   drawerDirty = true; updateMarkCounts(); renderDrawer(); scheduleRender(); syncBmButton();
 }
 function syncBmButton(){ $("dBm").textContent = focusId !== null && bookmarks.has(focusId) ? "Remove bookmark" : "Bookmark"; }
+function issueTitle(it){
+  const proc = procOf(it.pid);
+  return it.title.replace("{proc}", proc || (it.pid ? "pid " + it.pid : "unknown process"));
+}
 function openDrawer(tab){ drawerTab = tab; $("drawer").hidden = false; drawerDirty = true; renderDrawer(); }
 function toggleDrawer(tab){ if(!$("drawer").hidden && drawerTab === tab) $("drawer").hidden = true; else openDrawer(tab); }
 function renderDrawer(){
@@ -1606,7 +2209,10 @@ function renderDrawer(){
   drawerDirty = false;
   $("tabIssues").setAttribute("aria-selected", drawerTab === "issues");
   $("tabBm").setAttribute("aria-selected", drawerTab === "bm");
+  $("tabNoise").setAttribute("aria-selected", drawerTab === "noise");
+  $("dwPrev").hidden = $("dwNext").hidden = drawerTab === "noise";
   const list = $("dwList"), note = $("dwNote");
+  if(drawerTab === "noise"){ renderNoise(note, list); return; }
   if(drawerTab === "issues"){
     const vis = visibleIssues(), byKind = {};
     vis.forEach(it => byKind[it.kind] = (byKind[it.kind] || 0) + it.count);
@@ -1616,7 +2222,7 @@ function renderDrawer(){
       const proc = procOf(it.pid);
       return `<div class="it${it.entryId === focusId ? " cur" : ""}" tabindex="0" data-id="${it.entryId}">` +
         `<div class="top"><span class="kb k-${it.kind}">${ISSUE[it.kind]}</span><span class="when">${esc(it.time.slice(0, 8))}</span>${it.count > 1 ? `<span class="cnt">×${it.count}</span>` : ""}</div>` +
-        `<div class="ttl">${esc(it.title.replace("{proc}", proc || (it.pid ? "pid " + it.pid : "unknown process")))}</div>` +
+        `<div class="ttl">${esc(issueTitle(it))}</div>` +
         (it.sub ? `<div class="sub">${esc(it.sub)}</div>` : (proc && !it.title.includes("{proc}") ? `<div class="sub">${esc(proc)}</div>` : "")) + `</div>`;
     }).join("") : `<div class="empty2">Crashes, native crashes, ANRs, Unity exceptions, out-of-memory errors, apps that die or are killed for low memory, and FPS drops on Quest show up here as they happen.</div>`;
   } else {
@@ -1636,6 +2242,7 @@ $("issuesBtn").onclick = () => toggleDrawer("issues");
 $("bmBtn").onclick = () => toggleDrawer("bm");
 $("tabIssues").onclick = () => openDrawer("issues");
 $("tabBm").onclick = () => openDrawer("bm");
+$("tabNoise").onclick = () => { noise = null; openDrawer("noise"); };
 $("dwClose").onclick = () => { $("drawer").hidden = true; };
 $("dwNext").onclick = () => stepMarks(drawerTab, 1);
 $("dwPrev").onclick = () => stepMarks(drawerTab, -1);
@@ -1643,21 +2250,228 @@ $("dBm").onclick = () => toggleBookmark(focusId);
 $("dwList").addEventListener("click", ev => {
   if(ev.target.closest("input")) return;
   const del = ev.target.closest("[data-del]");
-  if(del){ bookmarks.delete(+del.dataset.del); drawerDirty = true; updateMarkCounts(); renderDrawer(); scheduleRender(); syncBmButton(); return; }
-  const it = ev.target.closest(".it"); if(it) goToEntry(+it.dataset.id);
+  if(del){ bookmarks.delete(+del.dataset.del); saveBmStore(); drawerDirty = true; updateMarkCounts(); renderDrawer(); scheduleRender(); syncBmButton(); return; }
+  const it = ev.target.closest(".it"); if(it && it.dataset.id) goToEntry(+it.dataset.id);
 });
 $("dwList").addEventListener("keydown", ev => {
   const it = ev.target.closest(".it");
-  if(ev.key === "Enter" && it && !ev.target.closest("input")){ ev.preventDefault(); goToEntry(+it.dataset.id); }
+  if(ev.key === "Enter" && it && it.dataset.id && !ev.target.closest("input")){ ev.preventDefault(); goToEntry(+it.dataset.id); }
 });
-$("dwList").addEventListener("input", ev => { const n = ev.target.dataset.note; if(n !== undefined) bookmarks.set(+n, ev.target.value); });
+$("dwList").addEventListener("input", ev => { const n = ev.target.dataset.note; if(n !== undefined){ bookmarks.set(+n, ev.target.value); saveBmStore(); } });
 $("dwNote").addEventListener("change", ev => {
   if(ev.target.id === "dwAppOnly"){ settings.issuesAppOnly = ev.target.checked; save(); drawerDirty = true; updateMarkCounts(); renderDrawer(); }
 });
 $("dwNote").addEventListener("click", ev => {
   if(ev.target.id === "dwBmExport"){ $("expScope").value = "bookmarked"; $("export").click(); }
-  if(ev.target.id === "dwBmClear"){ bookmarks.clear(); drawerDirty = true; updateMarkCounts(); renderDrawer(); scheduleRender(); syncBmButton(); toast("Bookmarks cleared"); }
+  if(ev.target.id === "dwBmClear"){ bookmarks.clear(); saveBmStore(); drawerDirty = true; updateMarkCounts(); renderDrawer(); scheduleRender(); syncBmButton(); toast("Bookmarks cleared"); }
 });
+
+// ------------------------------------------------------------------ device info + bug summary
+const VERSION = "__VERSION__";
+let devInfo = null;
+async function loadInfo(){
+  const serial = $("device").value;
+  if(!serial || !adbReady) return;
+  const pkgs = settings.apps.map(a => a.pkg).join(",");
+  try {
+    const j = await api(`/api/info?serial=${encodeURIComponent(serial)}&pkgs=${encodeURIComponent(pkgs)}`);
+    if(j.ok){ devInfo = j; renderInfo(); }
+  } catch {}
+}
+const deviceText = () => devInfo ? [`${devInfo.manufacturer} ${devInfo.model}`.trim(), devInfo.build && "build " + devInfo.build,
+  devInfo.android && "Android " + devInfo.android, devInfo.battery != null && `battery ${devInfo.battery}%` + (devInfo.bat_temp != null ? ` (${devInfo.bat_temp} °C)` : "")]
+  .filter(Boolean).join(" · ") : "";
+const appsText = () => devInfo ? devInfo.apps.map(a => a.installed ? `${a.pkg} ${a.version} (${a.code})` : `${a.pkg} (not installed)`).join(", ") : "";
+function renderInfo(){
+  const el = $("devLine");
+  if(!devInfo){ el.hidden = true; return; }
+  el.innerHTML = `<span><b>${esc((devInfo.manufacturer + " " + devInfo.model).trim())}</b> · ${esc(deviceText().split(" · ").slice(1).join(" · "))}</span>` +
+    devInfo.apps.map(a => `<span><b>${esc(a.pkg)}</b> ${a.installed ? esc(a.version + " (" + a.code + ")") : "not installed"}</span>`).join("");
+  el.hidden = false;
+}
+setInterval(() => { if(wasRunning) loadInfo(); }, 60000);
+
+function bugSummary(){
+  const vis = visibleIssues(), bms = [...bookmarks.keys()].sort((a, b) => a - b).map(id => entryById(id)).filter(Boolean);
+  const timed = entries.filter(e => e.t);
+  const span = timed.length ? `${timed[0].t.slice(0, 8)} – ${timed[timed.length - 1].t.slice(0, 8)}` : "";
+  const md = [], html = [];
+  md.push(`**Log summary** (VR Log Inspector ${VERSION})`, "");
+  html.push(`<p><b>Log summary</b> (VR Log Inspector ${esc(VERSION)})</p><ul>`);
+  const facts = [];
+  if(devInfo) facts.push(["Device", deviceText()]);
+  if(devInfo && devInfo.apps.length) facts.push(["Apps", appsText()]);
+  facts.push(["Log", [span, `${fmt(entries.length)} lines`, session && `session ${session}`].filter(Boolean).join(" · ")]);
+  facts.forEach(([k, v]) => { md.push(`- **${k}:** ${v}`); html.push(`<li><b>${esc(k)}:</b> ${esc(v)}</li>`); });
+  html.push("</ul>");
+  md.push("", `**Issues detected (${vis.length})**`);
+  html.push(`<p><b>Issues detected (${vis.length})</b></p>`);
+  if(vis.length){
+    html.push("<ul>");
+    vis.slice(0, 20).forEach(it => {
+      const line = `${it.time.slice(0, 8)} · ${ISSUE[it.kind]}${it.count > 1 ? " ×" + it.count : ""} — ${issueTitle(it)}${it.sub ? " — " + it.sub : ""}`;
+      md.push("- " + line); html.push(`<li>${esc(line)}</li>`);
+    });
+    if(vis.length > 20){ md.push(`- …and ${vis.length - 20} more`); html.push(`<li>…and ${vis.length - 20} more</li>`); }
+    html.push("</ul>");
+  } else { md.push("- None"); html.push("<p>None</p>"); }
+  if(bms.length){
+    md.push("", `**Bookmarked lines (${bms.length})**`);
+    html.push(`<p><b>Bookmarked lines (${bms.length})</b></p><ul>`);
+    bms.forEach(e => {
+      const note = bookmarks.get(e.id);
+      md.push(`- \`${e.t} ${e.lvl} ${e.tag}\` ${e.msg}${note ? " — _" + note + "_" : ""}`);
+      html.push(`<li><code>${esc(e.t + " " + e.lvl + " " + e.tag)}</code> ${esc(e.msg)}${note ? " — <i>" + esc(note) + "</i>" : ""}</li>`);
+    });
+    html.push("</ul>");
+  }
+  return {md: md.join("\n"), html: html.join("")};
+}
+$("bugBtn").onclick = async () => {
+  if(!entries.length){ toast("Nothing captured yet."); return; }
+  if(!devInfo) await loadInfo();
+  const {md, html} = bugSummary();
+  try {
+    await navigator.clipboard.write([new ClipboardItem({"text/html": new Blob([html], {type: "text/html"}),
+                                                        "text/plain": new Blob([md], {type: "text/plain"})})]);
+  } catch {
+    try { await navigator.clipboard.writeText(md); } catch { toast("Couldn't copy to the clipboard."); return; }
+  }
+  toast("Bug summary copied. Paste it into the bug.");
+};
+
+// ------------------------------------------------------------------ sessions: bookmarks survive reloads, recovery
+let session = "", bmStore = {};
+const bmKey = s => "vrli.bm." + s;
+function loadBmStore(){
+  try { bmStore = session ? JSON.parse(localStorage.getItem(bmKey(session)) || "{}") : {}; } catch { bmStore = {}; }
+}
+function saveBmStore(){
+  if(!session) return;
+  const out = {};
+  for(const [id, note] of bookmarks){ const e = entryById(id); if(e && e.sid !== undefined) out[e.sid] = note; }
+  bmStore = out;
+  try { localStorage.setItem(bmKey(session), JSON.stringify(out)); } catch {}
+}
+const ago = t => { const m = Math.round((Date.now() / 1000 - t) / 60); return m < 1 ? "just now" : m < 60 ? m + " min ago" : m < 1440 ? Math.round(m / 60) + " h ago" : Math.round(m / 1440) + " d ago"; };
+const when = t => new Date(t * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
+let sessCache = [];
+async function loadSessions(){
+  try {
+    const j = await api("/api/sessions");
+    sessCache = j.sessions;
+    const names = new Set(j.all);
+    for(let i = localStorage.length - 1; i >= 0; i--){        // forget bookmarks of deleted sessions
+      const k = localStorage.key(i);
+      if(k && k.startsWith("vrli.bm.") && !names.has(k.slice(8)) && k.slice(8) !== j.current) localStorage.removeItem(k);
+    }
+    $("sessList").innerHTML = j.sessions.length ? j.sessions.map(x =>
+      `<div class="s${x.name === j.current ? " cur" : ""}"><div><b>${esc(x.model || x.serial || "Headset")} · ${esc(when(x.started))}</b>` +
+      `<small>${fmt(x.lines || 0)} lines · updated ${ago(x.updated)}</small></div>` +
+      (x.name === j.current ? `<small>open</small>` : `<button data-load="${esc(x.name)}">Open</button>`) + `</div>`).join("")
+      : `<span class="hint" style="margin:0">No saved sessions yet.</span>`;
+    return j;
+  } catch { return null; }
+}
+function resetView(){
+  entries = []; filtered = []; selected.clear(); ignoredCount = 0; prevEntry = null; setFocus(null); resetMarks();
+  contextId = null; prevSearch = null; updateBack(); recount(); updateCounts(); scheduleRender();
+}
+async function openSession(name){
+  const j = await api("/api/sessions/load", {name});
+  if(!j.ok){ toast(j.error); return; }
+  resetView();
+  cursor = 0; epoch = 0;               // fetch the opened session from its first line
+  $("recBar").hidden = true;
+  toast("Session opened. Press Start to keep adding to it.");
+  setTimeout(loadSessions, 800);
+}
+$("sessList").addEventListener("click", ev => { const b = ev.target.closest("[data-load]"); if(b) openSession(b.dataset.load); });
+async function offerRecovery(){
+  const j = await loadSessions();
+  if(!j || entries.length || wasRunning || j.current) return;
+  const last = j.sessions[0];
+  if(!last || !last.lines || Date.now() / 1000 - last.updated > 86400) return;
+  $("recTxt").innerHTML = `<b>Recover your last session?</b><small>${esc(last.model || last.serial || "Headset")}, started ${esc(when(last.started))}, ${fmt(last.lines)} lines, last saved ${ago(last.updated)}. Bookmarks and notes come back too.</small>`;
+  $("recGo").onclick = () => openSession(last.name);
+  $("recBar").hidden = false;
+}
+$("recNo").onclick = () => { $("recBar").hidden = true; };
+
+// ------------------------------------------------------------------ noise finder
+let noise = null;
+const escRe = s => s.replace(/[.*+?^${}()|[\]\\\/]/g, "\\$&");
+function computeNoise(){
+  const counts = new Map();
+  for(const e of filtered){
+    if(!e.msg.trim() || e.head) continue;           // count each message once, not its stack trace
+    const key = e.tag + "\u0000" + normKey(e.msg);
+    const c = counts.get(key);
+    if(c) c.n++; else counts.set(key, {n: 1, tag: e.tag, msg: e.msg, lvl: e.lvl});
+  }
+  const total = filtered.filter(e => !e.head).length || 1;
+  return {total, top: [...counts.values()].filter(c => c.n > 1).sort((a, b) => b.n - a.n).slice(0, 30)};
+}
+function noisePattern(c){
+  // the message with its numbers replaced by \d+, so the rule keeps matching when values change
+  const body = escRe(c.msg).replace(/0x[0-9a-f]+/gi, "0x[0-9a-f]+").replace(/\d+/g, "\\d+");
+  return `/^${escRe(c.tag)} ${body}$/`;
+}
+function renderNoise(note, list){
+  if(!noise) noise = computeNoise();
+  note.innerHTML = `<span>Most repeated messages among the ${fmt(noise.total)} shown.</span><button id="dwNoiseRefresh" style="margin-left:auto">Refresh</button>`;
+  list.innerHTML = noise.top.length ? noise.top.map((c, i) => {
+    const pct = 100 * c.n / noise.total;
+    return `<div class="it noise" data-n="${i}" style="cursor:default">` +
+      `<div class="top"><span class="kb" style="color:var(--l-${c.lvl.toLowerCase()})">${c.lvl}</span><span>${esc(c.tag)}</span>` +
+      `<span class="cnt">${fmt(c.n)} · ${pct < 1 ? pct.toFixed(1) : Math.round(pct)}%</span></div>` +
+      `<div class="ttl">${esc(c.msg.slice(0, 200))}</div><div class="bar" style="width:${Math.max(2, Math.min(100, pct))}%"></div>` +
+      `<div class="acts"><button data-ign="msg" title="Ignore this message, whatever its numbers">Ignore message</button>` +
+      `<button data-ign="tag" title="Ignore everything with this tag">Ignore tag ${esc(c.tag)}</button></div></div>`;
+  }).join("") : `<div class="empty2">No repeated messages in what's shown. Nothing to clean up.</div>`;
+}
+$("dwList").addEventListener("click", ev => {
+  const b = ev.target.closest("[data-ign]"); if(!b) return;
+  ev.stopPropagation();
+  const c = noise.top[+b.closest("[data-n]").dataset.n];
+  addIgnore(b.dataset.ign === "tag" ? "tag:" + c.tag : noisePattern(c));
+  noise = null; drawerDirty = true; renderDrawer();
+}, true);
+$("dwNote").addEventListener("click", ev => { if(ev.target.id === "dwNoiseRefresh"){ noise = null; drawerDirty = true; renderDrawer(); } });
+
+// ------------------------------------------------------------------ updates
+let updState = "", updPollT = null;
+function renderUpdate(u){
+  updState = u.state;
+  const bar = $("updBar"), busy = ["downloading", "installing", "restarting"].includes(u.state);
+  const st = $("updState");
+  st.textContent = u.state === "unconfigured" ? "Updates aren't set up for this copy." : (u.message || "");
+  $("updCheck").disabled = u.state === "unconfigured" || u.state === "checking" || busy;
+  const dismissed = sessionStorage.getItem("vrli.updLater") === (u.latest && u.latest.version);
+  if(u.state === "available" && !dismissed || busy || (u.state === "error" && bar.dataset.active)){
+    bar.hidden = false;
+    bar.classList.toggle("err", u.state === "error");
+    $("updProg").hidden = u.state !== "downloading";
+    if(u.state === "downloading") $("updFill").style.width = (u.total ? Math.round(100 * u.received / u.total) : 20) + "%";
+    $("updGo").hidden = $("updLater").hidden = busy;
+    $("updGo").textContent = u.state === "error" ? "Try again" : "Update now";
+    $("updNotesBtn").hidden = !(u.latest && u.latest.notes);
+    $("updNotes").textContent = (u.latest && u.latest.notes) || "";
+    $("updTxt").innerHTML = u.state === "available" ? `<b>VR Log Inspector ${esc(u.latest.version)} is available</b><small>You have ${esc(u.current)}. Updating restarts the tool; the capture carries on by itself.</small>`
+      : `<b>${esc(u.message)}</b>` + (u.state === "restarting" ? `<small>The page reloads by itself in a few seconds.</small>` : "");
+  } else if(!busy) bar.hidden = true;
+  clearTimeout(updPollT);
+  if(busy || u.state === "checking") updPollT = setTimeout(checkUpdate, 500);
+}
+async function checkUpdate(mode){
+  try { renderUpdate(await api("/api/update" + (mode ? "?check=" + mode : ""))); } catch {}
+}
+$("updCheck").onclick = () => checkUpdate("force");
+$("updGo").onclick = async () => { $("updBar").dataset.active = "1"; if(updState === "error") await checkUpdate("force"); await api("/api/update/apply", {}); checkUpdate(); };
+$("updLater").onclick = () => { const v = $("updTxt").textContent.match(/Inspector (\S+)/); if(v) sessionStorage.setItem("vrli.updLater", v[1]); $("updBar").hidden = true; };
+$("updNotesBtn").onclick = () => { $("updNotes").hidden = !$("updNotes").hidden; };
+setTimeout(checkUpdate, 4000);                         // the server checks on its own 3 s after starting
+setInterval(() => checkUpdate("1"), 30 * 60000);
 
 // ------------------------------------------------------------------ appearance
 const THEMES = [
@@ -1794,13 +2608,13 @@ $("adbGet").onclick = async () => { renderAdb(await api("/api/adb/download", {})
 $("appsOn").checked = settings.appsOn; $("appFollow").checked = settings.appFollow; $("appMention").checked = settings.appMention;
 compileApps(); renderApps(); applySide(); applyAppearance();
 $("unityTags").value = settings.unityTags; $("xrTags").value = settings.xrTags;
-$("ignoreOn").checked = settings.ignoreOn; $("buffers").value = settings.buffers;
+$("ignoreOn").checked = settings.ignoreOn; $("hideEmpty").checked = settings.hideEmpty; $("buffers").value = settings.buffers;
 $("clearFirst").checked = settings.clearFirst; $("wifiAddr").value = settings.wifi || "";
 $("expScope").value = settings.expScope; $("expFmt").value = settings.expFmt;
 compileRules(); compileIgnore(); compileSearch();
 buildToggles(); renderChips(); recount(); updateCounts();
 onToggle($("cats"), catOn, "cats"); onToggle($("levels"), levelOn, "levels");
-checkAdb(); refreshDevices(); poll();
+checkAdb(); refreshDevices(); poll(); setTimeout(offerRecovery, 1200);
 </script>
 </body>
 </html>

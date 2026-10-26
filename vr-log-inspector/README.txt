@@ -28,10 +28,27 @@ SI EL SISTEMA LO BLOQUEA
            identificado, ve a Ajustes del Sistema > Privacidad y seguridad y
            pulsa "Abrir igualmente".
 
+SESIONES GUARDADAS
+  Cada captura se guarda sola en la carpeta "sessions" mientras la haces. Si
+  cierras la herramienta, se cuelga o se actualiza, al volver a abrirla te
+  ofrece recuperar la última sesión, con sus marcadores y notas. Las sesiones
+  anteriores están en "Recent sessions", en el panel izquierdo. Se guardan las
+  15 más recientes de los últimos 14 días.
+
+ACTUALIZACIONES
+  Si este paquete tiene un archivo update.json, la herramienta comprueba al
+  arrancar si hay una versión nueva y muestra un aviso con el botón
+  "Update now": se descarga, se verifica, se instala y se reinicia sola,
+  continuando la captura. También puedes comprobarlo en Appearance > Check for
+  updates. Si las actualizaciones vienen de un repo privado de GitHub, añade a
+  update.json tu token de solo lectura:
+      {"source": "github:USUARIO/REPO", "github_token": "github_pat_..."}
+
 NO BORRES
   - La carpeta "python" (paquete portable): es el Python que usa la herramienta.
   - La carpeta "platform-tools" una vez descargada: es adb. Si la borras, la
     herramienta te ofrecerá descargarla otra vez.
+  - update.json: indica dónde buscar actualizaciones.
 
 Para actualizar a una versión nueva, sustituye vr_log_inspector.py (o el
 paquete entero). Tus preferencias se guardan en el navegador y se conservan.

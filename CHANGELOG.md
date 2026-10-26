@@ -2,6 +2,24 @@
 
 ## VR Log Inspector
 
+### 1.8 · 2026-10-26
+
+- **Actualizaciones automáticas:** al arrancar comprueba si hay una versión nueva y muestra un aviso con sus novedades. "Update now" la descarga, verifica su checksum, la instala, reinicia la herramienta y continúa la captura donde estaba. Las actualizaciones pueden venir de una carpeta compartida, de una dirección web o de las Releases de GitHub. También se puede comprobar desde Appearance.
+- **Autoguardado de sesiones:** cada captura se guarda en disco mientras se hace. Al volver a abrir la herramienta ofrece recuperar la última sesión, con sus marcadores y notas, y el panel izquierdo lista las sesiones recientes.
+- **Reconexión automática:** si el visor se desconecta (cable, reposo o Wi-Fi), la herramienta reintenta sola y retoma el log justo donde se cortó, sin duplicar líneas. El log marca el corte y la reconexión.
+- **Información del dispositivo y de las apps:** modelo, build, versión de Android, batería y versión de cada app vigilada, visibles bajo la barra superior e incluidas en las exportaciones (.log y .json).
+- **Copy bug summary:** copia un resumen para el bug con el dispositivo, las versiones, el intervalo del log, los problemas detectados y las líneas marcadas con sus notas. Se pega con formato en Azure DevOps y como Markdown en cualquier otro sitio.
+- **Buscador de ruido (pestaña Noise):** lista los mensajes que más se repiten, con su porcentaje, y permite ignorar un mensaje (sean cuales sean sus números) o su tag con un clic.
+- La exportación en .json pasa a incluir el dispositivo y las apps, con las líneas dentro de `lines`.
+
+### 1.7 · 2026-10-21
+
+- **Los mensajes de varias líneas se tratan como uno solo.** La captura usa ahora el formato `logcat -v long`, que indica exactamente dónde empieza y acaba cada mensaje. Al ignorar un error de Unity se ocultan también su traza, la línea `(Filename: …)` y sus líneas en blanco.
+- Las líneas en blanco del final de cada mensaje ya no aparecen.
+- Nueva opción **Hide lines with an empty message**, activada por defecto, en la sección de palabras ignoradas. También se aplica a los logs abiertos desde archivo.
+- Las excepciones de Unity se detectan solo en la primera línea de cada mensaje, no en su traza.
+- Los archivos exportados en .log mantienen el formato de siempre (`threadtime`).
+
 ### 1.6 · 2026-10-21
 
 - **Lista de problemas (Issues):** detecta en directo, y también en logs abiertos desde archivo, crashes de Java (con la excepción que los causó), crashes nativos, ANR, excepciones de Unity, errores de memoria (OutOfMemoryError), apps que mueren o que el sistema cierra por falta de memoria, y caídas de FPS en Quest. Los problemas repetidos se agrupan con un contador. Con el filtro por app activo, muestra solo los de esas apps.
@@ -57,4 +75,4 @@
 ### 0.1 · 2026-10-21
 
 - Primera versión, en pruebas: graba a la vez logcat, vídeo (scrcpy o el grabador del visor), métricas de rendimiento y marcadores (notas, capturas, crashes, ANR, excepciones de Unity, caídas de FPS) y lo empaqueta en un zip con un informe HTML.
-- Aún no incluye las mejoras de VR Log Inspector 1.1–1.6 (temas, tamaño de texto, descarga automática de adb, lanzadores).
+- Aún no incluye las mejoras de VR Log Inspector 1.1–1.8 (temas, tamaño de texto, descarga automática de adb, lanzadores).

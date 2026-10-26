@@ -5,6 +5,10 @@ dist/
 platform-tools/
 python/
 vr_sessions/
+sessions/
+.restart.json
+*.bak
+update.json
 # Python
 __pycache__/
 *.pyc
