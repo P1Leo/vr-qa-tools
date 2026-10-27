@@ -5,7 +5,7 @@ Solo usan la librería estándar de Python 3.8+ y adb.
 
 | Herramienta | Estado | Qué hace |
 | --- | --- | --- |
-| [`vr-log-inspector/`](vr-log-inspector/) | 1.8 | Visor de logcat en directo en el navegador: filtro por app, búsqueda, palabras ignoradas, detección de crashes y ANR, marcadores, contexto de una línea, exportación, temas y tamaño de texto. |
+| [`vr-log-inspector/`](vr-log-inspector/) | 1.9 | Visor de logcat en directo en el navegador: filtro por app, búsqueda, palabras ignoradas, detección de crashes y ANR, marcadores, contexto de una línea, exportación, uso por Wi-Fi, temas y tamaño de texto. |
 | [`vr-session-recorder/`](vr-session-recorder/) | 0.1, en pruebas | Graba una sesión de bug (log, vídeo, métricas y marcadores) y la empaqueta en un zip con un informe HTML. |
 
 La documentación de uso de VR Log Inspector está en Notion. Los cambios de cada versión, en [CHANGELOG.md](CHANGELOG.md).
@@ -48,7 +48,7 @@ Cada paquete lleva un `update.json` que dice dónde buscar versiones nuevas. Al 
 | --- | --- | --- |
 | Carpeta compartida (red o sincronizada con OneDrive, Google Drive o SharePoint) | `\\servidor\compartido\VR Log Inspector` o `~/OneDrive - Empresa/Tools/VR Log Inspector` | El zip normal y `latest.json` de cada versión en esa carpeta |
 | Dirección web | `https://servidor/vr-log-inspector/latest.json` | El zip normal y `latest.json` en esa dirección |
-| Releases de este repo | `github:USUARIO/vr-qa-tools` (valor por defecto) | Nada: lo hace GitHub Actions. En un repo privado cada usuario necesita acceso al repo y un token de solo lectura en su `update.json` (`"github_token"`) |
+| Releases de este repo | `github:USUARIO/vr-qa-tools` (valor por defecto) | Nada: lo hace GitHub Actions. Con el repo público no hace falta token: la herramienta lee la última Release por sus enlaces de descarga, sin pasar por la API de GitHub ni su límite de consultas. Si el repo vuelve a ser privado, cada usuario necesita acceso y un token de solo lectura en su `update.json` (`"github_token"`) |
 
 Para elegir el origen de los paquetes que genera GitHub Actions, crea la variable `UPDATE_SOURCE` en **Settings → Secrets and variables → Actions → Variables**. Para una carpeta compartida también se puede generar todo directamente en ella:
 

@@ -9,6 +9,7 @@ sessions/
 .restart.json
 *.bak
 update.json
+wifi_headsets.json
 # Python
 __pycache__/
 *.pyc

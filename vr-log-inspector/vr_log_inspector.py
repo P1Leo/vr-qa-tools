@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -34,10 +35,11 @@ import urllib.request
 import webbrowser
 import zipfile
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-TOOL_VERSION = "1.8"
+TOOL_VERSION = "1.9"
 ADB = None
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # hide console windows on Windows
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -157,13 +159,65 @@ def run_cmd(cmd, timeout=15):
         return False, "timed out"
 
 
+ADB_RESTARTS = deque(maxlen=20)
+ADB_CONFLICT_HINT = ("Another program keeps restarting adb with a different version, which cuts the connection: "
+                     "often PICO Developer Center, Meta Quest Developer Hub, SideQuest or Android Studio. Close it, "
+                     "or start VR Log Inspector with --adb pointing to that program's adb.")
+
+
+def note_adb_output(text):
+    low = text.lower()
+    if "daemon not running" in low or "doesn't match this client" in low or "server version" in low and "killing" in low:
+        ADB_RESTARTS.append(time.time())
+
+
+def adb_conflict():
+    now = time.time()
+    return sum(1 for t in ADB_RESTARTS if now - t < 120) >= 3
+
+
+ADB_STATES = ("device", "offline", "unauthorized", "authorizing", "connecting", "bootloader", "recovery", "sideload", "unknown")
+
+
+def parse_state(out, serial=None):
+    """The state word from adb get-state, ignoring the notes adb adds when its server restarts.
+    If get-state gives nothing usable, the state shown by "adb devices" is used instead."""
+    for line in out.splitlines():
+        if line.strip() in ADB_STATES:
+            return line.strip()
+    if serial is not None and "error" not in out.lower():
+        for d in list_devices().get("devices", []):
+            if d["serial"] == serial:
+                return d["state"]
+    return ""
+
+
+def why_unreachable(serial):
+    """A short explanation of why the headset doesn't answer, from adb get-state."""
+    ok, out = run_adb((["-s", serial] if serial else []) + ["get-state"], 8)
+    low = out.lower()
+    if parse_state(out, serial if serial else None) == "device":
+        return "", True
+    if adb_conflict():
+        return ADB_CONFLICT_HINT, False
+    if "unauthorized" in low:
+        return "Put on the headset and accept the USB debugging prompt.", False
+    if "offline" in low:
+        return "The headset is offline: unplug the cable and plug it in again.", False
+    if "more than one" in low:
+        return "More than one headset is connected: pick one in the list.", False
+    return "The headset isn't reachable (cable, sleep or Wi-Fi).", False
+
+
 def run_adb(args, timeout=15):
     if not ADB:
         return False, "adb isn't installed yet. Use the Download adb button at the top of the page."
     try:
         res = subprocess.run([ADB] + args, capture_output=True, text=True,
                              timeout=timeout, creationflags=NO_WINDOW)
-        return res.returncode == 0, (res.stdout + res.stderr).strip()
+        out = (res.stdout + res.stderr).strip()
+        note_adb_output(res.stderr)
+        return res.returncode == 0, out
     except FileNotFoundError:
         return False, f"adb not found ('{ADB}'). Install Android platform-tools or pass --adb."
     except subprocess.TimeoutExpired:
@@ -356,12 +410,14 @@ class LineBuffer:
 # --update-source, or with the VRLI_UPDATE_SOURCE variable. It can be:
 #   * a folder (shared drive, OneDrive/Google Drive/SharePoint synced folder) with latest.json + the zip
 #   * an https URL of latest.json (the zip must sit next to it)
-#   * github:OWNER/REPO, reading latest.json from the newest log-inspector release.
-#     Private repos need a read-only token: "github_token" in update.json or VRLI_GITHUB_TOKEN.
+#   * github:OWNER/REPO, reading latest.json from the newest log-inspector release. Public repos
+#     need nothing else; private ones need a read-only token ("github_token" in update.json or
+#     VRLI_GITHUB_TOKEN) and then go through the GitHub API.
 UPDATE = {"source": "", "token": "", "state": "idle", "message": "", "latest": None,
           "checked": 0, "received": 0, "total": 0}
 UPDATE_LOCK = threading.Lock()
 RESTART = {"requested": False, "server": None}
+BOOT_ID = int(time.time() * 1000)         # changes every time the tool starts: the page re-checks things
 RESTART_CODE = 75                     # the launchers start the tool again when it exits with this code
 RESTART_MARKER = os.path.join(TOOL_DIR, ".restart.json")
 
@@ -375,6 +431,8 @@ def load_update_config(cli_source):
         pass
     UPDATE["source"] = (cli_source or os.environ.get("VRLI_UPDATE_SOURCE") or cfg.get("source") or "").strip()
     UPDATE["token"] = (os.environ.get("VRLI_GITHUB_TOKEN") or cfg.get("github_token") or "").strip()
+    if not UPDATE["source"]:
+        start_check()           # sets the "no update.json" explanation right away
 
 
 def version_tuple(v):
@@ -425,6 +483,16 @@ def read_manifest():
     src, token = UPDATE["source"], UPDATE["token"]
     if src.startswith("github:"):
         repo = src[len("github:"):].strip("/")
+        if not token:
+            # public repo: the latest release's download links don't go through the GitHub API,
+            # whose limit without a token (60 requests/hour per IP) a whole office can exhaust
+            try:
+                man = json.loads(http_get(f"https://github.com/{repo}/releases/latest/download/latest.json"))
+                if man.get("tool") == "vr-log-inspector" and man.get("file"):
+                    man["download"] = f"https://github.com/{repo}/releases/download/log-inspector-v{man['version']}/{man['file']}"
+                    return man
+            except Exception:
+                pass                            # e.g. the latest release is another tool's: ask the API
         releases = json.loads(http_get(f"https://api.github.com/repos/{repo}/releases?per_page=30", token))
         for rel in releases:
             if rel.get("draft") or not rel.get("tag_name", "").startswith("log-inspector-v"):
@@ -451,16 +519,22 @@ def read_manifest():
     return man
 
 
-def check_update(force=False):
+def start_check(force=False):
+    """Mark a check as started (so whoever asked sees "checking" straight away) and run it in the background."""
     with UPDATE_LOCK:
         if not UPDATE["source"]:
-            UPDATE.update(state="unconfigured", message="No update source is configured for this copy.")
+            UPDATE.update(state="unconfigured", message="This copy has no update.json, so it can't look for new versions. "
+                                                        "Copies downloaded from the GitHub releases update themselves.")
             return
         if UPDATE["state"] in ("checking", "downloading", "installing", "restarting"):
             return
         if not force and time.time() - UPDATE["checked"] < 600:
             return
         UPDATE.update(state="checking", message="Checking for updates…")
+    threading.Thread(target=check_update, daemon=True).start()
+
+
+def check_update():
     try:
         man = read_manifest()
         newer = version_tuple(man.get("version")) > version_tuple(TOOL_VERSION)
@@ -566,10 +640,11 @@ class Capture:
             gen = self.gen
             self.serial, self.buffers = serial, buffers
             self.reconnecting = False
-        if not self._spawn(serial, buffers, gen, resume_from):
-            return False
         threading.Thread(target=self._track_procs, args=(serial, gen), daemon=True).start()
-        return True
+        if serial and device_state(serial) != "device":
+            threading.Thread(target=self._reconnect, args=(gen, True), daemon=True).start()
+            return True
+        return self._spawn(serial, buffers, gen, resume_from)
 
     def _spawn(self, serial, buffers, gen, since=""):
         cmd = [ADB] + (["-s", serial] if serial else []) + ["logcat", "-v", "long"]
@@ -594,25 +669,45 @@ class Capture:
         threading.Thread(target=self._reader, args=(proc, gen), daemon=True).start()
         return True
 
-    def _reconnect(self, gen):
+    def _reconnect(self, gen, initial=False):
         """The headset went away (cable, sleep, Wi-Fi): wait for it and carry on where the log stopped."""
         serial, buffers = self.serial, self.buffers
         lost = time.time()
-        self.buf.add(f"--------- VR Log Inspector: connection lost at {time.strftime('%H:%M:%S')}, reconnecting")
+        if not initial:
+            self.buf.add(f"--------- VR Log Inspector: connection lost at {time.strftime('%H:%M:%S')}, reconnecting")
         while True:
             with self.lock:
                 if gen != self.gen:
                     return
                 self.reconnecting = True
-                self.message = f"Connection lost. Reconnecting… ({int(time.time() - lost)} s). Press Stop to give up."
             if serial and ":" in serial:      # Wi-Fi adb
                 run_adb(["connect", serial], 10)
-            ok, out = run_adb((["-s", serial] if serial else []) + ["get-state"], 10)
-            if ok and out.strip().endswith("device"):
+            why, ready = why_unreachable(serial)
+            if ready:
+                break
+            with self.lock:
+                if gen != self.gen:
+                    return
+                waited = int(time.time() - lost)
+                self.message = (f"Waiting for the headset… ({waited} s). " if initial else
+                                f"Connection lost. Reconnecting… ({waited} s). ") + why + " Press Stop to give up."
+            switched = ""
+            for kind, alt in (alternate_serials(serial) if serial else []):
+                if kind == "wifi":            # cable unplugged: carry on over Wi-Fi if the headset is in Wi-Fi mode
+                    adb_connect(alt)
+                if device_state(alt) == "device":
+                    switched = alt
+                    break
+            if switched:
+                serial = switched
+                with self.lock:
+                    self.serial = serial
+                self.buf.add(f"--------- VR Log Inspector: continuing over {'Wi-Fi' if ':' in serial else 'USB'} ({serial})")
                 break
             time.sleep(2)
         since = self.buf.last_timestamp()
-        self.buf.add(f"--------- VR Log Inspector: reconnected at {time.strftime('%H:%M:%S')} after {int(time.time() - lost)} s")
+        if not initial:
+            self.buf.add(f"--------- VR Log Inspector: reconnected at {time.strftime('%H:%M:%S')} after {int(time.time() - lost)} s")
         with self.lock:
             if gen != self.gen:
                 return
@@ -621,11 +716,12 @@ class Capture:
 
     def _track_procs(self, serial, gen):
         """Every 2 s, read which process name owns each PID, so the UI can filter by app."""
-        pre = ["-s", serial] if serial else []
         while True:
             with self.lock:
                 if gen != self.gen:
                     return
+                serial = self.serial              # may change from USB to Wi-Fi during a capture
+            pre = ["-s", serial] if serial else []
             ok, out = run_adb(pre + ["shell", "ps -A -o PID,NAME"], 10)
             snap = {}
             for line in out.splitlines()[1:]:
@@ -675,6 +771,15 @@ class Capture:
         threading.Thread(target=flush_when_idle, daemon=True).start()
         for raw in iter(proc.stdout.readline, b""):
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if line.strip() == "- waiting for device -":
+                # newer adb versions don't exit when they lose the headset: they wait forever.
+                # Stop this logcat and reconnect ourselves (resuming right after the last line).
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                break
+            note_adb_output(line)
             with lock:
                 state["last"] = time.time()
                 m = LONG_HEADER.match(line)
@@ -714,7 +819,10 @@ class Capture:
 
     def status(self):
         with self.lock:
-            return {"running": self.running, "serial": self.serial, "message": self.message,
+            msg = self.message
+            if (self.running or self.reconnecting) and adb_conflict() and ADB_CONFLICT_HINT not in msg:
+                msg += " " + ADB_CONFLICT_HINT
+            return {"running": self.running, "serial": self.serial, "message": msg,
                     "reconnecting": self.reconnecting, "buffers": self.buffers}
 
 
@@ -775,8 +883,224 @@ def list_devices():
         info = dict(p.split(":", 1) for p in parts[2:] if ":" in p)
         devices.append({"serial": parts[0], "state": parts[1],
                         "model": info.get("model", "").replace("_", " "),
-                        "product": info.get("product", "")})
+                        "product": info.get("product", ""),
+                        "wifi": ":" in parts[0]})
     return {"ok": True, "devices": devices}
+
+
+# --------------------------------------------------------------------------- Wi-Fi headsets
+# adb can only reach a headset through a connection it already has, so switching to Wi-Fi
+# needs the cable once: we read the headset's IP over USB, put adbd in TCP mode
+# ("adb tcpip"), connect to it and remember it. TCP mode lasts until the headset restarts.
+WIFI_PORT = 5555
+IP_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+
+def data_dir():
+    return os.path.dirname(SESSIONS_DIR) if SESSIONS_DIR else TOOL_DIR
+
+
+def load_known():
+    try:
+        with open(os.path.join(data_dir(), "wifi_headsets.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_known(known):
+    try:
+        with open(os.path.join(data_dir(), "wifi_headsets.json"), "w", encoding="utf-8") as f:
+            json.dump(known, f, indent=1)
+    except OSError:
+        pass
+
+
+def remember(hw, model, ip, port=WIFI_PORT):
+    known = load_known()
+    known[hw] = {"model": model, "ip": ip, "port": port, "last": time.time()}
+    save_known(known)
+
+
+def headset_ip(serial):
+    """The headset's Wi-Fi IPv4 address, read through an existing (USB) connection."""
+    ok, out = run_adb(["-s", serial, "shell", "ip route"], 10)
+    for line in out.splitlines():
+        if "wlan" in line:
+            m = re.search(r"\bsrc (\d{1,3}(?:\.\d{1,3}){3})", line)
+            if m:
+                return m.group(1)
+    ok, out = run_adb(["-s", serial, "shell", "ip -f inet addr show wlan0"], 10)
+    m = re.search(r"inet (\d{1,3}(?:\.\d{1,3}){3})/", out)
+    return m.group(1) if m else ""
+
+
+def props(serial, *names):
+    ok, out = run_adb(["-s", serial, "shell", "getprop"], 10)
+    p = dict(re.findall(r"^\[([^\]]+)\]: \[([^\]]*)\]", out, re.M))
+    return [p.get(n, "") for n in names]
+
+
+def adb_connect(addr):
+    ok, out = run_adb(["connect", addr], 12)
+    low = out.lower()
+    good = ok and ("connected to" in low) and "cannot" not in low and "failed" not in low
+    return good, out.strip()
+
+
+def device_state(serial):
+    ok, out = run_adb(["-s", serial, "get-state"], 8)
+    return parse_state(out, serial)
+
+
+def enable_wifi(serial):
+    if ":" in serial:
+        return {"ok": False, "message": "This headset is already connected over Wi-Fi."}
+    ip = headset_ip(serial)
+    if not ip:
+        return {"ok": False, "message": "The headset isn't connected to a Wi-Fi network. Connect it to Wi-Fi in its settings and try again."}
+    hw, model = props(serial, "ro.serialno", "ro.product.model")
+    hw = hw or serial
+    ok, out = run_adb(["-s", serial, "tcpip", str(WIFI_PORT)], 15)
+    if not ok:
+        return {"ok": False, "message": f"Couldn't switch the headset to Wi-Fi mode: {out}"}
+    addr = f"{ip}:{WIFI_PORT}"
+    last = ""
+    for _ in range(8):                      # adbd restarts on the headset: give it a moment
+        time.sleep(1.2)
+        good, last = adb_connect(addr)
+        if good and device_state(addr) in ("device", "unauthorized"):
+            break
+    else:
+        return {"ok": False, "ip": ip, "message": f"The headset is in Wi-Fi mode at {ip}, but this PC can't reach it ({last}). "
+                                                  "The PC and the headset must be on the same network; some guest or corporate Wi-Fi networks keep devices apart."}
+    remember(hw, model, ip)
+    state = device_state(addr)
+    return {"ok": True, "ip": ip, "serial": addr, "state": state,
+            "message": (f"Connected over Wi-Fi at {ip}. You can unplug the cable." if state == "device"
+                        else f"Connected at {ip}: put on the headset and accept the debugging prompt.")}
+
+
+def connect_wifi(addr):
+    addr = addr.strip()
+    if not addr:
+        return {"ok": False, "message": "Enter the headset IP, e.g. 192.168.1.40"}
+    if ":" not in addr:
+        addr += f":{WIFI_PORT}"
+    good, out = adb_connect(addr)
+    if not good:
+        return {"ok": False, "message": f"Couldn't connect to {addr}: {out}. If the headset was restarted, "
+                                        "plug it in once and use Switch to Wi-Fi again."}
+    state = device_state(addr)
+    if state == "device":
+        hw, model = props(addr, "ro.serialno", "ro.product.model")
+        if hw:
+            remember(hw, model, addr.rsplit(":", 1)[0], int(addr.rsplit(":", 1)[1]))
+    return {"ok": True, "serial": addr, "state": state,
+            "message": f"Connected to {addr}." if state == "device" else f"Connected to {addr}: put on the headset and accept the debugging prompt."}
+
+
+def wifi_overview():
+    devs = list_devices().get("devices", [])
+    online = {d["serial"]: d for d in devs}
+    known = []
+    for hw, d in sorted(load_known().items(), key=lambda kv: -kv[1].get("last", 0)):
+        addr = f"{d['ip']}:{d.get('port', WIFI_PORT)}"
+        known.append({"hw": hw, "model": d.get("model", ""), "ip": d["ip"], "addr": addr,
+                      "connected": online.get(addr, {}).get("state") == "device", "last": d.get("last", 0)})
+    usb = [d for d in devs if ":" not in d["serial"] and d["state"] == "device"]
+    by_hw = {k["hw"]: k for k in known}
+    for d in usb:                     # already switched: the USB serial is the headset's hardware serial
+        k = by_hw.get(d["serial"])
+        if k and k["connected"]:
+            d["wifi_addr"] = k["addr"]
+    return {"known": known, "usb": usb}
+
+
+def local_prefixes():
+    ips = set()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))        # no packet is sent: this only picks the outgoing interface
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    own = {ip for ip in ips if not ip.startswith(("127.", "169.254."))}
+    return sorted({ip.rsplit(".", 1)[0] for ip in own})[:3], own
+
+
+def scan_network():
+    """Look in this PC's local network(s) for devices with Wi-Fi debugging on (TCP port 5555 open)."""
+    prefixes, own = local_prefixes()
+    if os.environ.get("VRLI_SCAN_NETWORKS"):          # for tests
+        prefixes = os.environ["VRLI_SCAN_NETWORKS"].split(",")
+    if not prefixes:
+        return {"ok": False, "message": "This PC doesn't seem to be on a local network.", "found": []}
+
+    def probe(ip):
+        try:
+            with socket.create_connection((ip, WIFI_PORT), timeout=0.6):
+                return ip
+        except OSError:
+            return None
+    targets = [f"{p}.{i}" for p in prefixes for i in range(1, 255) if f"{p}.{i}" not in own]
+    with ThreadPoolExecutor(max_workers=96) as pool:
+        hits = [ip for ip in pool.map(probe, targets) if ip]
+    by_ip = {d["ip"]: d for d in load_known().values()}
+    online = {d["serial"]: d for d in list_devices().get("devices", [])}
+    found = []
+    for ip in hits:
+        addr = f"{ip}:{WIFI_PORT}"
+        k = by_ip.get(ip, {})
+        found.append({"ip": ip, "addr": addr, "model": k.get("model") or online.get(addr, {}).get("model", ""),
+                      "known": bool(k), "connected": online.get(addr, {}).get("state") == "device"})
+    return {"ok": True, "found": found, "networks": [p + ".0/24" for p in prefixes]}
+
+
+def reconnect_known(hw):
+    """Connect to a remembered headset. If its IP changed (home routers do that), find it again
+    on this PC's network by its serial number and remember the new address."""
+    d = load_known().get(hw)
+    if not d:
+        return {"ok": False, "message": "That headset is no longer in the list."}
+    addr = f"{d['ip']}:{d.get('port', WIFI_PORT)}"
+    good, out = adb_connect(addr)
+    if good and device_state(addr) in ("device", "unauthorized"):
+        state = device_state(addr)
+        return {"ok": True, "serial": addr, "state": state,
+                "message": f"Connected to {d.get('model') or 'the headset'} at {d['ip']}." if state == "device"
+                           else "Connected: put on the headset and accept the debugging prompt."}
+    run_adb(["disconnect", addr], 8)
+    scan = scan_network()
+    for f in scan.get("found", []):
+        if f["ip"] == d["ip"]:
+            continue
+        cand = f["addr"]
+        good, _ = adb_connect(cand)
+        if good and device_state(cand) == "device" and props(cand, "ro.serialno")[0] == hw:
+            remember(hw, d.get("model", ""), f["ip"], WIFI_PORT)
+            return {"ok": True, "serial": cand, "state": "device", "moved": True,
+                    "message": f"The headset changed its IP to {f['ip']}. Found it and connected."}
+        if not f.get("connected"):
+            run_adb(["disconnect", cand], 8)    # not ours: don't leave it connected
+    return {"ok": False, "message": f"Couldn't find {d.get('model') or 'the headset'} on this network. If it was restarted, "
+                                    "plug it in with the cable and use Switch to Wi-Fi again. The PC and the headset "
+                                    "must be on the same network."}
+
+
+def alternate_serials(serial):
+    """Other ways to reach the same headset: its Wi-Fi address if we have it on USB, and the other way round."""
+    known = load_known()
+    if ":" in serial:
+        return [("usb", hw) for hw, d in known.items() if f"{d['ip']}:{d.get('port', WIFI_PORT)}" == serial]
+    d = known.get(serial)
+    return [("wifi", f"{d['ip']}:{d.get('port', WIFI_PORT)}")] if d else []
 
 
 # --------------------------------------------------------------------------- http
@@ -827,17 +1151,20 @@ class Handler(BaseHTTPRequestHandler):
             lines, nxt, more, ep, session = BUF.since(cursor, epoch, 20000)
             procs, ver = CAP.procs_since(pver)
             return self._json({"lines": lines, "next": nxt, "more": more, "epoch": ep, "session": session,
-                               "status": CAP.status(), "procs": procs, "pver": ver, "version": TOOL_VERSION})
+                               "status": CAP.status(), "procs": procs, "pver": ver, "version": TOOL_VERSION,
+                               "boot": BOOT_ID})
         if url.path == "/api/info":
             pkgs = [p for p in q.get("pkgs", [""])[0].split(",") if p]
             return self._json(device_info(q.get("serial", [""])[0], pkgs))
+        if url.path == "/api/wifi":
+            return self._json(wifi_overview())
         if url.path == "/api/sessions":
             allsess = list_sessions()
             return self._json({"sessions": allsess[:10], "all": [x["name"] for x in allsess],
                                "current": BUF.session, "dir": SESSIONS_DIR})
         if url.path == "/api/update":
             if q.get("check", [""])[0]:
-                threading.Thread(target=check_update, args=(q["check"][0] == "force",), daemon=True).start()
+                start_check(q["check"][0] == "force")
             out = {k: UPDATE[k] for k in ("source", "state", "message", "latest", "received", "total")}
             out["current"] = TOOL_VERSION
             return self._json(out)
@@ -874,12 +1201,18 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=apply_update, daemon=True).start()
             return self._json({"ok": True})
         if path == "/api/connect":
-            addr = str(body.get("addr", "")).strip()
-            if not addr:
-                return self._json({"ok": False, "output": "Enter the headset IP, e.g. 192.168.1.40:5555"})
-            ok, out = run_adb(["connect", addr])
-            return self._json({"ok": ok and "cannot" not in out.lower() and "failed" not in out.lower(),
-                               "output": out})
+            return self._json(connect_wifi(str(body.get("addr", ""))))
+        if path == "/api/wifi/enable":
+            return self._json(enable_wifi(str(body.get("serial", ""))))
+        if path == "/api/wifi/reconnect":
+            return self._json(reconnect_known(str(body.get("hw", ""))))
+        if path == "/api/wifi/forget":
+            known = load_known()
+            d = known.pop(str(body.get("hw", "")), None)
+            save_known(known)
+            if d:
+                run_adb(["disconnect", f"{d['ip']}:{d.get('port', WIFI_PORT)}"], 8)
+            return self._json({"ok": True})
         self._send(404, "not found", "text/plain")
 
 
@@ -949,7 +1282,7 @@ def main():
             BUF.flush()
     threading.Thread(target=autosave, daemon=True).start()
     if UPDATE["source"]:
-        threading.Timer(3, check_update).start()
+        threading.Timer(3, start_check).start()
 
     try:
         server.serve_forever()
@@ -1221,6 +1554,15 @@ mark{background:color-mix(in srgb, var(--accent) 35%, transparent);color:inherit
 .noise .bar{height:4px;border-radius:2px;background:var(--accent);margin-top:5px;opacity:.7}
 .noise .acts{display:flex;gap:6px;margin-top:6px}
 .noise .acts button{padding:2px 9px;font-size:calc(12px * var(--fs))}
+.appear.wifi{left:12px;right:auto;width:calc(430px * var(--fs));max-height:min(80vh, calc(640px * var(--fs)));overflow:auto}
+.whint{color:var(--muted);font-size:calc(12px * var(--fs));margin:4px 0 0}
+.wfl{display:flex;flex-direction:column;gap:5px}
+.wf{display:flex;align-items:center;gap:8px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--panel-2)}
+.wf > div{flex:1;min-width:0}
+.wf b{display:block;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wf small{color:var(--muted)}
+.wf .on{color:var(--ok)}
+.wf .x{border:0;background:none;padding:0 4px;color:var(--muted)}
 .updline{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin-top:8px;color:var(--muted);font-size:calc(12px * var(--fs))}
 .appear{position:absolute;right:12px;top:calc(100% + 6px);width:calc(340px * var(--fs));max-width:calc(100vw - 24px);background:var(--panel);border:1px solid var(--line);
   border-radius:var(--radius);padding:14px;box-shadow:0 12px 32px rgba(0,0,0,.35);z-index:20}
@@ -1261,10 +1603,7 @@ mark{background:color-mix(in srgb, var(--accent) 35%, transparent);color:inherit
     <select id="device" title="Headset" style="max-width:240px"><option value="">No headset found</option></select>
     <button id="refresh" title="Rescan connected headsets">Rescan</button>
   </div>
-  <div class="inline">
-    <input id="wifiAddr" type="text" placeholder="IP:5555 for Wi-Fi adb" style="width:170px">
-    <button id="connect">Connect</button>
-  </div>
+  <button id="wifiBtn" aria-haspopup="dialog" aria-expanded="false" aria-controls="wifiPop" title="Use headsets over Wi-Fi, without a cable">Wi-Fi</button>
   <select id="buffers" title="Which logcat buffers to read">
     <option value="main,system,crash">main + system + crash</option>
     <option value="all">all buffers</option>
@@ -1279,6 +1618,17 @@ mark{background:color-mix(in srgb, var(--accent) 35%, transparent);color:inherit
     <button id="fsDownQ" title="Smaller text" aria-label="Smaller text">A−</button><button id="fsUpQ" title="Larger text" aria-label="Larger text">A+</button>
   </div>
   <button id="appearBtn" aria-haspopup="dialog" aria-expanded="false" title="Theme, text size and display options">Appearance</button>
+  <div class="appear wifi" id="wifiPop" role="dialog" aria-label="Wi-Fi headsets" hidden>
+    <h3>Wi-Fi headsets</h3>
+    <p class="whint">Use a headset without the cable. The cable is needed once to switch Wi-Fi debugging on, and again after the headset restarts. The PC and the headset must be on the same network.</p>
+    <h4>Connected by cable</h4>
+    <div class="wfl" id="wfUsb"></div>
+    <h4>Known headsets</h4>
+    <div class="wfl" id="wfKnown"></div>
+    <h4>Connect by IP</h4>
+    <div class="row-in"><input id="wifiAddr" type="text" placeholder="192.168.1.40"><button id="connect">Connect</button></div>
+    <p class="whint">The headset shows its IP in its Wi-Fi settings, under the network it's connected to.</p>
+  </div>
   <div class="appear" id="appear" role="dialog" aria-label="Appearance" hidden>
     <h3>Appearance</h3>
     <div class="themes" id="themes" role="radiogroup" aria-label="Theme"></div>
@@ -1950,7 +2300,7 @@ async function refreshDevices(){
     if(!j.ok){ sel.innerHTML = `<option value="">adb unavailable</option>`; setStatus("off", j.error); return; }
     if(!j.devices.length){ sel.innerHTML = `<option value="">No headset found</option>`; return; }
     sel.innerHTML = j.devices.map(d => {
-      const name = (d.model || d.product || "Device") + " · " + d.serial + (d.state !== "device" ? ` (${d.state})` : "");
+      const name = (d.model || d.product || "Device") + (d.wifi ? " · Wi-Fi " + d.serial.replace(/:5555$/, "") : " · USB " + d.serial) + (d.state !== "device" ? ` (${d.state})` : "");
       return `<option value="${esc(d.serial)}" data-model="${esc(d.model || d.serial)}" ${d.state !== "device" ? "disabled" : ""}>${esc(name)}</option>`;
     }).join("");
     if(settings.serial && j.devices.some(d => d.serial === settings.serial)) sel.value = settings.serial;
@@ -1963,9 +2313,14 @@ function setStatus(kind, text){
   $("dot").className = "dot" + (kind === "on" ? " on" : kind === "off" ? " off" : kind === "warn" ? " warn" : "");
   $("statusText").textContent = text; $("status").title = text;
 }
-let wasRunning = false;
+let wasRunning = false, statusSerial = "";
 function applyStatus(s){
   const active = s.running || s.reconnecting;
+  if(active && s.serial && s.serial !== statusSerial && statusSerial){
+    refreshDevices().then(() => { if([...$("device").options].some(o => o.value === s.serial)){ $("device").value = s.serial; settings.serial = s.serial; save(); } });
+    toast(s.serial.includes(":") ? "The cable was unplugged: the capture continues over Wi-Fi." : "Continuing over the cable.");
+  }
+  if(s.serial) statusSerial = s.serial;
   setStatus(s.reconnecting ? "warn" : s.running ? "on" : "", s.message);
   $("start").disabled = !adbReady; $("stop").disabled = !active;
   $("start").textContent = active ? "Restart" : "Start";
@@ -1979,10 +2334,13 @@ $("buffers").onchange = () => { settings.buffers = $("buffers").value; save(); }
 $("clearFirst").onchange = () => { settings.clearFirst = $("clearFirst").checked; save(); };
 $("connect").onclick = async () => {
   const addr = $("wifiAddr").value.trim(); settings.wifi = addr; save();
+  $("connect").disabled = true;
   const j = await api("/api/connect", {addr});
-  toast(j.output || (j.ok ? "Connected" : "Could not connect"));
-  refreshDevices();
+  $("connect").disabled = false;
+  toast(j.message);
+  if(j.ok){ await useDevice(j.serial); loadWifi(); }
 };
+$("wifiAddr").addEventListener("keydown", ev => { if(ev.key === "Enter") $("connect").click(); });
 $("start").onclick = async () => {
   $("start").disabled = true;
   const j = await api("/api/start", {serial: $("device").value, clear: $("clearFirst").checked, buffers: $("buffers").value});
@@ -2002,6 +2360,8 @@ async function poll(){
   try {
     const j = await api(`/api/logs?since=${cursor}&epoch=${epoch}&pver=${pver}`);
     if(j.version && j.version !== VERSION){ location.reload(); return; }   // updated and restarted
+    if(j.boot && serverBoot && j.boot !== serverBoot){ checkUpdate("1"); checkAdb(); loadSessions(); }   // the tool was restarted
+    if(j.boot) serverBoot = j.boot;
     epoch = j.epoch; cursor = j.next;
     if(j.session !== session){ session = j.session || ""; loadBmStore(); }
     if(j.lines.length) addLines(j.lines, j.next - j.lines.length);
@@ -2440,14 +2800,16 @@ $("dwList").addEventListener("click", ev => {
 $("dwNote").addEventListener("click", ev => { if(ev.target.id === "dwNoiseRefresh"){ noise = null; drawerDirty = true; renderDrawer(); } });
 
 // ------------------------------------------------------------------ updates
-let updState = "", updPollT = null;
+let updState = "", updPollT = null, serverBoot = 0;
+let updLatest = "";
 function renderUpdate(u){
   updState = u.state;
+  updLatest = u.latest ? u.latest.version : "";
   const bar = $("updBar"), busy = ["downloading", "installing", "restarting"].includes(u.state);
   const st = $("updState");
-  st.textContent = u.state === "unconfigured" ? "Updates aren't set up for this copy." : (u.message || "");
-  $("updCheck").disabled = u.state === "unconfigured" || u.state === "checking" || busy;
-  const dismissed = sessionStorage.getItem("vrli.updLater") === (u.latest && u.latest.version);
+  st.textContent = u.message || "";
+  $("updCheck").disabled = u.state === "checking" || busy;
+  const dismissed = !!u.latest && sessionStorage.getItem("vrli.updLater") === u.latest.version + "|" + serverBoot;
   if(u.state === "available" && !dismissed || busy || (u.state === "error" && bar.dataset.active)){
     bar.hidden = false;
     bar.classList.toggle("err", u.state === "error");
@@ -2466,11 +2828,11 @@ function renderUpdate(u){
 async function checkUpdate(mode){
   try { renderUpdate(await api("/api/update" + (mode ? "?check=" + mode : ""))); } catch {}
 }
-$("updCheck").onclick = () => checkUpdate("force");
+$("updCheck").onclick = () => { sessionStorage.removeItem("vrli.updLater"); checkUpdate("force"); };
 $("updGo").onclick = async () => { $("updBar").dataset.active = "1"; if(updState === "error") await checkUpdate("force"); await api("/api/update/apply", {}); checkUpdate(); };
-$("updLater").onclick = () => { const v = $("updTxt").textContent.match(/Inspector (\S+)/); if(v) sessionStorage.setItem("vrli.updLater", v[1]); $("updBar").hidden = true; };
+$("updLater").onclick = () => { if(updLatest) sessionStorage.setItem("vrli.updLater", updLatest + "|" + serverBoot); $("updBar").hidden = true; };
 $("updNotesBtn").onclick = () => { $("updNotes").hidden = !$("updNotes").hidden; };
-setTimeout(checkUpdate, 4000);                         // the server checks on its own 3 s after starting
+setTimeout(() => checkUpdate("1"), 1500);
 setInterval(() => checkUpdate("1"), 30 * 60000);
 
 // ------------------------------------------------------------------ appearance
@@ -2556,9 +2918,59 @@ function setAppear(open){
   $("appear").hidden = !open; $("appearBtn").setAttribute("aria-expanded", open);
   if(open) $("themes").querySelector('[aria-checked="true"]')?.focus();
 }
-$("appearBtn").onclick = ev => { ev.stopPropagation(); setAppear($("appear").hidden); };
+$("appearBtn").onclick = ev => { ev.stopPropagation(); if($("appear").hidden) setWifiPop(false); setAppear($("appear").hidden); };
 document.addEventListener("click", ev => { if(!$("appear").hidden && !ev.target.closest("#appear")) setAppear(false); });
 document.addEventListener("keydown", ev => { if(ev.key === "Escape" && !$("appear").hidden){ setAppear(false); $("appearBtn").focus(); } }, true);
+
+// ------------------------------------------------------------------ Wi-Fi headsets
+async function useDevice(serial){
+  await refreshDevices();
+  if([...$("device").options].some(o => o.value === serial)){
+    $("device").value = serial; settings.serial = serial; save();
+    loadApps(); devInfo = null; renderInfo(); loadInfo();
+  }
+}
+const wfRow = (title, sub, actions) => `<div class="wf"><div><b>${title}</b><small>${sub}</small></div>${actions}</div>`;
+async function loadWifi(){
+  let j;
+  try { j = await api("/api/wifi"); } catch { return; }
+  $("wfUsb").innerHTML = j.usb.length ? j.usb.map(d => wfRow(esc(d.model || "Headset"), "USB · " + esc(d.serial) +
+      (d.wifi_addr ? ` · <span class="on">Wi-Fi ready, you can unplug it</span>` : ""),
+      d.wifi_addr ? "" : `<button data-enable="${esc(d.serial)}">Switch to Wi-Fi</button>`)).join("")
+    : `<p class="whint" style="margin:0">Plug a headset in with the cable to switch it to Wi-Fi.</p>`;
+  $("wfKnown").innerHTML = j.known.length ? j.known.map(k => wfRow(esc(k.model || "Headset"),
+      esc(k.ip) + " · " + (k.connected ? `<span class="on">connected</span>` : "not connected"),
+      (k.connected ? `<button data-use="${esc(k.addr)}">Use</button>` : `<button data-known="${esc(k.hw)}">Connect</button>`) +
+      `<button class="x" data-forget="${esc(k.hw)}" title="Forget this headset" aria-label="Forget ${esc(k.model || k.ip)}">✕</button>`)).join("")
+    : `<p class="whint" style="margin:0">Headsets you switch to Wi-Fi appear here, so next time you can connect without the cable.</p>`;
+}
+function setWifiPop(open){
+  $("wifiPop").hidden = !open; $("wifiBtn").setAttribute("aria-expanded", open);
+  if(open){ setAppear(false); loadWifi(); }
+}
+$("wifiBtn").onclick = ev => { ev.stopPropagation(); setWifiPop($("wifiPop").hidden); };
+document.addEventListener("click", ev => { if(!$("wifiPop").hidden && !ev.target.closest("#wifiPop") && !ev.target.closest(".toast")) setWifiPop(false); });
+document.addEventListener("keydown", ev => { if(ev.key === "Escape" && !$("wifiPop").hidden){ setWifiPop(false); $("wifiBtn").focus(); } }, true);
+$("wifiPop").addEventListener("click", async ev => {
+  const b = ev.target.closest("button"); if(!b) return;
+  if(b.dataset.enable){
+    b.disabled = true; b.textContent = "Switching…";
+    const j = await api("/api/wifi/enable", {serial: b.dataset.enable});
+    toast(j.message);
+    if(j.ok) await useDevice(j.serial);
+    loadWifi();
+  } else if(b.dataset.known){
+    b.disabled = true; b.textContent = "Connecting…";
+    const j = await api("/api/wifi/reconnect", {hw: b.dataset.known});
+    toast(j.message);
+    if(j.ok) await useDevice(j.serial);
+    loadWifi();
+  } else if(b.dataset.use){
+    await useDevice(b.dataset.use); toast("Using the headset over Wi-Fi."); setWifiPop(false);
+  } else if(b.dataset.forget){
+    await api("/api/wifi/forget", {hw: b.dataset.forget}); loadWifi(); refreshDevices();
+  }
+});
 
 // ------------------------------------------------------------------ adb setup
 let adbPollT = null, adbReady = true;

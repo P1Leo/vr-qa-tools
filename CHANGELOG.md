@@ -2,6 +2,17 @@
 
 ## VR Log Inspector
 
+### 1.9 · 2026-10-27
+
+- **Visores por Wi-Fi sin comandos:** nuevo botón **Wi-Fi** en la barra superior. **Switch to Wi-Fi** pasa a Wi-Fi un visor conectado por cable con un clic: obtiene su IP, activa la depuración por Wi-Fi y se conecta.
+- **Visores conocidos:** los visores que se pasan a Wi-Fi quedan guardados y se reconectan con **Connect**, sin cable, mientras no se reinicien. Si el router les ha dado otra IP, la herramienta los encuentra sola en la red del PC (los identifica por su número de serie) y guarda la nueva dirección.
+- **Desenchufar sin cortar la captura:** si se quita el cable de un visor que ya está en modo Wi-Fi, la captura sigue por Wi-Fi sin perder líneas; y si se cae la Wi-Fi con el cable conectado, sigue por cable.
+- El desplegable de visores indica si cada uno está conectado por USB o por Wi-Fi.
+- Corregido: la captura podía quedarse parada mostrando solo `- waiting for device -`, porque las versiones recientes de adb no terminan al perder el visor. Ahora la herramienta lo detecta, reconecta y sigue desde la última línea.
+- Al pulsar **Start** con el visor aún no listo, espera a que lo esté y explica por qué: falta aceptar el aviso de depuración, el visor está *offline* o no está conectado.
+- Avisa cuando otro programa (PICO Developer Center, Meta Quest Developer Hub, SideQuest, Android Studio…) está reiniciando adb con otra versión y cortando la conexión.
+- Actualizaciones: **Check for updates** vuelve a mostrar el aviso aunque se hubiera pulsado **Later**, y **Later** dura solo hasta que se cierra la herramienta. La página vuelve a comprobar si hay versión nueva cuando la herramienta se reinicia, y una copia sin `update.json` explica por qué no puede actualizarse.
+
 ### 1.8 · 2026-10-26
 
 - **Actualizaciones automáticas:** al arrancar comprueba si hay una versión nueva y muestra un aviso con sus novedades. "Update now" la descarga, verifica su checksum, la instala, reinicia la herramienta y continúa la captura donde estaba. Las actualizaciones pueden venir de una carpeta compartida, de una dirección web o de las Releases de GitHub. También se puede comprobar desde Appearance.
@@ -75,4 +86,4 @@
 ### 0.1 · 2026-10-21
 
 - Primera versión, en pruebas: graba a la vez logcat, vídeo (scrcpy o el grabador del visor), métricas de rendimiento y marcadores (notas, capturas, crashes, ANR, excepciones de Unity, caídas de FPS) y lo empaqueta en un zip con un informe HTML.
-- Aún no incluye las mejoras de VR Log Inspector 1.1–1.8 (temas, tamaño de texto, descarga automática de adb, lanzadores).
+- Aún no incluye las mejoras de VR Log Inspector 1.1–1.9 (temas, tamaño de texto, descarga automática de adb, lanzadores).

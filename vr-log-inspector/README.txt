@@ -28,6 +28,18 @@ SI EL SISTEMA LO BLOQUEA
            identificado, ve a Ajustes del Sistema > Privacidad y seguridad y
            pulsa "Abrir igualmente".
 
+USAR EL VISOR POR WI-FI
+  Botón "Wi-Fi" de la barra superior:
+  1. Con el visor conectado por cable, pulsa "Switch to Wi-Fi". La herramienta
+     obtiene la IP del visor, activa la depuración por Wi-Fi y se conecta.
+  2. Ya puedes desenchufar el cable. Si estabas capturando, la captura sigue
+     sola por Wi-Fi.
+  3. El visor queda en "Known headsets": la próxima vez pulsa "Connect". Si el
+     router le ha dado otra IP, la herramienta lo encuentra sola en tu red.
+  El modo Wi-Fi se desactiva cuando el visor se reinicia; entonces hay que
+  conectarlo otra vez por cable y repetir el paso 1. El PC y el visor deben
+  estar en la misma red.
+
 SESIONES GUARDADAS
   Cada captura se guarda sola en la carpeta "sessions" mientras la haces. Si
   cierras la herramienta, se cuelga o se actualiza, al volver a abrirla te
